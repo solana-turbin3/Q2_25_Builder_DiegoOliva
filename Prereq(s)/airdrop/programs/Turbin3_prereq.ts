@@ -1,6 +1,5 @@
 import { Idl } from "@coral-xyz/anchor";
 
-// Type definitions for the program
 export type Turbin3Prereq = Idl & {
     version: "0.1.0";
     name: "turbine_prereq";
