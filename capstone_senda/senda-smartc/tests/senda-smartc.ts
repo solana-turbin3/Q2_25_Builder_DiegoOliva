@@ -95,13 +95,11 @@ const getTokenBalance = async (tokenAccount: PublicKey): Promise<number> => {
 
 const getRecentBlockhashArray = async (connection: Connection): Promise<number[]> => {
   const { blockhash } = await connection.getLatestBlockhash();
-  // Convert the blockhash to a PublicKey first, then get its bytes
   const blockhashKey = new PublicKey(blockhash);
   const blockhashBytes = blockhashKey.toBytes();
   return Array.from(blockhashBytes);
 };
 
-// Add these helper functions at the top level
 const getDepositRecordPDA = (
   escrowPda: PublicKey,
   depositorPubkey: PublicKey,
@@ -232,9 +230,6 @@ describe("senda_dapp", () => {
     console.log(`Authority USDC balance: ${await getTokenBalance(authorityUsdcAta)}`);
     console.log(`Authority USDT balance: ${await getTokenBalance(authorityUsdtAta)}`);
 
-    // Instead of attempting to pre-fund all wallets at once,
-    // we'll fund them individually using the ensureTokenBalance helper function
-    // when needed in each test.
     console.log("Token pre-funding skipped - wallets will be funded as needed in each test");
   });
 
@@ -255,7 +250,6 @@ describe("senda_dapp", () => {
     const factoryPda = factoryPDA;
 
     try {
-      // First check if the factory account already exists
       try {
         const existingFactory = await program.account.factory.fetch(factoryPda);
 
@@ -445,7 +439,7 @@ describe("senda_dapp", () => {
         .deposit(
           { usdc: {} },
           { sender: {} },
-          blockhashArray,  // Pass the array directly
+          blockhashArray,
           amountToDeposit
         )
         .accounts({
@@ -572,7 +566,7 @@ describe("senda_dapp", () => {
     const blockhashArray = await getRecentBlockhashArray(connection);
     const [depositRecordPda, depositRecordBump] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
 
-    const amountToDeposit = new BN(100_000_000); // 0.1 USDT with 9 decimals (reduced amount)
+    const amountToDeposit = new BN(100_000_000);
 
     try {
       const tx = await program.methods
@@ -899,7 +893,7 @@ describe("senda_dapp", () => {
     );
 
     // Transfer enough USDT to sender account
-    const depositTokenAmount = 1_000_000_000; // 1 USDT with 9 decimals
+    const depositTokenAmount = 1_000_000_000;
 
     await provider.sendAndConfirm(
       new Transaction().add(
@@ -918,7 +912,6 @@ describe("senda_dapp", () => {
     console.log(`Transferred 1 USDT to sender for dual signature test`);
     console.log(`Sender USDT balance after funding: ${await getTokenBalance(senderUsdtAta)}`);
 
-    // Create escrow with random seed
     const escrowSeed = new BN(randomBytes(8));
 
     const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
@@ -963,13 +956,10 @@ describe("senda_dapp", () => {
 
     const blockhashArray = await getRecentBlockhashArray(connection);
 
-    // Create deposit record
     const [depositRecordPda] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
 
-    // Use a smaller deposit amount for USDT
-    const depositAmount = new BN(100_000_000); // 0.1 USDT with 9 decimals (reduced from 1 USDT)
+    const depositAmount = new BN(100_000_000);
 
-    // Make the deposit with dual signature policy
     const depositIx = await program.methods
       .deposit({ usdt: {} }, { both: {} }, blockhashArray, depositAmount)
       .accounts({
@@ -1007,16 +997,13 @@ describe("senda_dapp", () => {
       throw err;
     }
 
-    // Check initial balances before release
     const receiverUsdtBefore = await getTokenBalance(receiverUsdtAta);
     const vaultUsdtBefore = await getTokenBalance(vaultUsdt);
 
     console.log(`Receiver USDT balance before release: ${receiverUsdtBefore}`);
     console.log(`Vault USDT balance before release: ${vaultUsdtBefore}`);
 
-    // Now attempt to release with both signatures
     try {
-      // Create the release instruction
       const releaseIx = await program.methods
         .release(blockhashArray)
         .accounts({
@@ -1041,26 +1028,22 @@ describe("senda_dapp", () => {
         } as ReleaseAccounts)
         .instruction();
 
-      // Create a transaction with the release instruction
       const releaseTx = new Transaction().add(releaseIx);
 
-      // Sign with both parties
       const releaseSig = await web3.sendAndConfirmTransaction(
         connection,
         releaseTx,
-        [depositSender, depositReceiver] // Both parties must sign for dual signature policy
+        [depositSender, depositReceiver]
       );
 
       console.log(`Released funds with dual signature: ${releaseSig}`);
 
-      // Verify final balances
       const receiverUsdtAfter = await getTokenBalance(receiverUsdtAta);
       const vaultUsdtAfter = await getTokenBalance(vaultUsdt);
 
       console.log(`Receiver USDT balance after release: ${receiverUsdtAfter}`);
       console.log(`Vault USDT balance after release: ${vaultUsdtAfter}`);
 
-      // Validate that the transfer occurred correctly
       assert.strictEqual(vaultUsdtAfter, 0, "Vault should be empty after release");
       assert.strictEqual(
         Math.round(receiverUsdtAfter * 10) / 10,
@@ -1075,7 +1058,6 @@ describe("senda_dapp", () => {
   });
 
   it("releases funds using single signature policy when receiver is the signer", async () => {
-    // Generate new wallets to avoid account reuse
     const depositSender = Keypair.generate();
     const depositReceiver = Keypair.generate();
 
@@ -1175,7 +1157,6 @@ describe("senda_dapp", () => {
 
     console.log(`Transferred 1 USDC to sender for receiver-signer test`);
 
-    // Use a random seed to avoid account reuse
     const escrowSeed = new BN(randomBytes(8));
 
     const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
@@ -1220,12 +1201,11 @@ describe("senda_dapp", () => {
 
     const depositAmount = new BN(500_000);
 
-    // Create a deposit with single signature policy where the receiver is the designated signer
     await program.methods
       .deposit(
         { usdc: {} },
         { receiver: {} },
-        blockhashArray,  // Pass the array directly
+        blockhashArray,
         depositAmount
       )
       .accounts({
@@ -1247,7 +1227,7 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY
       } as DepositAccounts)
-      .signers([depositSender, authority])  // Only the depositor needs to sign the deposit
+      .signers([depositSender, authority])
       .rpc();
 
     console.log(`Deposit with receiver as authorized signer: success`);
@@ -1257,10 +1237,8 @@ describe("senda_dapp", () => {
     console.log(`Receiver USDC balance before release: ${receiverBalanceBefore}`);
     console.log(`Vault USDC balance before release: ${vaultBalanceBefore}`);
 
-    // Get the latest blockhash for transaction
     const blockhash = await connection.getLatestBlockhash();
 
-    // Create the release instruction
     const releaseIx = await program.methods
       .release(blockhashArray)
       .accounts({
@@ -1285,21 +1263,16 @@ describe("senda_dapp", () => {
       } as ReleaseAccounts)
       .instruction()
 
-    // Create a transaction and add the instruction
     const releaseTx = new Transaction().add(releaseIx);
 
-    // Set the fee payer to the receiver (the authorized signer)
     // releaseTx.feePayer = depositReceiver.publicKey;
     // releaseTx.recentBlockhash = blockhash.blockhash;
 
-    // // Sign the transaction with the receiver keypair
     // releaseTx.sign(depositReceiver);
 
-    // // Send the signed transaction
     // const rawTx = releaseTx.serialize();
     // const txId = await connection.sendRawTransaction(rawTx);
 
-    // Wait for confirmation
     // await connection.confirmTransaction({
     //   signature: txId,
     //   ...blockhash
@@ -1473,7 +1446,7 @@ describe("senda_dapp", () => {
       .deposit(
         { usdc: {} },
         { sender: {} },
-        blockhashArray,  // Pass the array directly
+        blockhashArray,
         depositAmount
       )
       .accounts({
@@ -1531,7 +1504,7 @@ describe("senda_dapp", () => {
       .instruction();
 
     const releaseTx = new Transaction();
-    releaseTx.add(releaseIx); // Add the instruction to the transaction
+    releaseTx.add(releaseIx);
 
     // releaseTx.feePayer = depositSender.publicKey;
 
@@ -1570,7 +1543,7 @@ describe("senda_dapp", () => {
     // Generate new wallets for this test
     const depositSender = Keypair.generate();
     const depositReceiver = Keypair.generate();
-    const unauthorizedSigner = Keypair.generate(); // Third party that will try to release
+    const unauthorizedSigner = Keypair.generate();
 
     // Fund the wallets
     await provider.sendAndConfirm(
@@ -1673,7 +1646,6 @@ describe("senda_dapp", () => {
 
     console.log(`Transferred 1 USDC to sender for unauthorized release test`);
 
-    // Create an escrow with a random seed
     const escrowSeed = new BN(randomBytes(8));
 
     const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
@@ -1691,7 +1663,6 @@ describe("senda_dapp", () => {
       program.programId
     );
 
-    // Initialize the escrow
     await program.methods
       .initializeEscrow(escrowSeed)
       .accounts({
@@ -2047,7 +2018,6 @@ describe("senda_dapp", () => {
 
     console.log(`Transferred 1 USDC to sender for cancel test`);
 
-    // Create an escrow with a random seed
     const escrowSeed = new BN(randomBytes(8));
 
     const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
@@ -2065,7 +2035,6 @@ describe("senda_dapp", () => {
       program.programId
     );
 
-    // Initialize escrow
     await program.methods
       .initializeEscrow(escrowSeed)
       .accounts({
@@ -2091,7 +2060,6 @@ describe("senda_dapp", () => {
 
     const blockhashArray = await getRecentBlockhashArray(connection);
 
-    // Create a deposit record
     const [depositRecordPda] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
 
     // Make a deposit with single signature policy (sender as signer)
@@ -2166,7 +2134,7 @@ describe("senda_dapp", () => {
       .cancel(blockhashArray)
       .accounts({
         escrow: escrowPda,
-        originalDepositor: depositSender.publicKey, // The original depositor must be a signer
+        originalDepositor: depositSender.publicKey,
         counterparty: depositReceiver.publicKey,
         depositorUsdcAta: senderUsdcAta,
         depositorUsdtAta: senderUsdtAta,
@@ -2213,7 +2181,6 @@ describe("senda_dapp", () => {
   });
 
   it("prevents double release of funds", async () => {
-    // Generate new wallets for this test
     const depositSender = Keypair.generate();
     const depositReceiver = Keypair.generate();
 
@@ -2311,10 +2278,8 @@ describe("senda_dapp", () => {
 
     console.log(`Transferred 1 USDC to sender for double release test`);
 
-    // Use a random seed for escrow creation
     const escrowSeed = new BN(randomBytes(8));
 
-    // Initialize escrow
     const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
       [Buffer.from("escrow"), depositSender.publicKey.toBuffer(), depositReceiver.publicKey.toBuffer()],
       program.programId
@@ -2363,7 +2328,7 @@ describe("senda_dapp", () => {
       .deposit(
         { usdc: {} },
         { sender: {} },
-        blockhashArray,  // Pass the array directly
+        blockhashArray,
         new BN(500_000)
       )
       .accounts({
@@ -2422,7 +2387,6 @@ describe("senda_dapp", () => {
     // Create transaction for first release
     const release1Tx = new Transaction().add(releaseIx);
 
-    // Sign and send the first release
     // const blockHash = await connection.getLatestBlockhash();
     // release1Tx.feePayer = depositSender.publicKey;
     // release1Tx.recentBlockhash = blockHash.blockhash;
@@ -2656,7 +2620,7 @@ describe("senda_dapp", () => {
       .deposit(
         { usdc: {} },
         { receiver: {} },
-        blockhashArray,  // Pass the array directly
+        blockhashArray,
         depositAmount
       )
       .accounts({
@@ -2685,7 +2649,6 @@ describe("senda_dapp", () => {
 
     console.log("Releasing funds...");
 
-    // Release the funds with receiver as signer (using program.methods directly rather than manual transaction building)
     await program.methods
       .release(blockhashArray)
       .accounts({
@@ -2715,7 +2678,6 @@ describe("senda_dapp", () => {
 
     console.log("Attempting to cancel after release...");
     try {
-      // Try to cancel after release - should fail with InvalidState error
       await program.methods
         .cancel(blockhashArray)
         .accounts({
@@ -2735,7 +2697,7 @@ describe("senda_dapp", () => {
           systemProgram: SystemProgram.programId,
           rent: SYSVAR_RENT_PUBKEY
         } as CancelAccounts)
-        .signers([depositSender]) // Make sure depositor signs
+        .signers([depositSender])
         .rpc();
 
       assert.fail("Should have thrown an error - cancellation after release should not be possible");
@@ -2844,7 +2806,7 @@ describe("senda_dapp", () => {
           senderUsdcAta,
           authority.publicKey,
           tokenAmount,
-          usdcDecimals // Use correct decimals instead of hardcoded value
+          usdcDecimals
         )
       ),
       [authority]
@@ -2858,7 +2820,7 @@ describe("senda_dapp", () => {
           senderUsdtAta,
           authority.publicKey,
           tokenAmount,
-          usdtDecimals // Use correct decimals instead of hardcoded value
+          usdtDecimals
         )
       ),
       [authority]
@@ -2908,8 +2870,7 @@ describe("senda_dapp", () => {
 
     const [depositRecord0, depositRecord0Bump] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
 
-    // Smaller deposit amount to allow for multiple deposits
-    const depositAmount = new BN(100_000); // 0.1 USDC with 6 decimals instead of 1 billion
+    const depositAmount = new BN(100_000);
 
     // First deposit
     const deposit0Ix = await program.methods
@@ -3169,7 +3130,7 @@ describe("senda_dapp", () => {
           USDT_MINT_ADDR,
           senderUsdtAta,
           authority.publicKey,
-          200_000_000, // 0.2 USDT with 9 decimals
+          200_000_000,
           usdtDecimals
         )
       ),
@@ -3178,7 +3139,6 @@ describe("senda_dapp", () => {
 
     console.log(`Transferred 0.2 USDT to sender for USDT cancel test`);
 
-    // Create escrow with a random seed
     const escrowSeed = new BN(randomBytes(8));
     const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
       [Buffer.from("escrow"), depositSender.publicKey.toBuffer(), depositReceiver.publicKey.toBuffer()],
@@ -3195,7 +3155,6 @@ describe("senda_dapp", () => {
       program.programId
     );
 
-    // Initialize escrow
     await program.methods
       .initializeEscrow(escrowSeed)
       .accounts({
@@ -3231,13 +3190,13 @@ describe("senda_dapp", () => {
     const [depositRecordPda] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
 
     // Deposit USDT into the escrow
-    const depositAmount = new BN(100_000_000); // 0.1 USDT with 9 decimals (reduced amount)
+    const depositAmount = new BN(100_000_000);
 
     const depositIx = await program.methods
       .deposit(
         { usdt: {} },
         { sender: {} },
-        blockhashArray,  // Pass the array directly
+        blockhashArray,
         depositAmount
       )
       .accounts({
@@ -3497,7 +3456,6 @@ describe("senda_dapp", () => {
 
     const [depositRecordB, depositRecordBBump] = getDepositRecordPDA(escrowPda, partyB.publicKey, blockhashArray);
 
-    // Make a smaller deposit to not exceed balance
     const depositAmountA = new BN(300_000);
 
     // Party A deposits USDC
@@ -3531,7 +3489,7 @@ describe("senda_dapp", () => {
     console.log(`Current deposit count: ${escrowState.depositCount.toNumber()}`);
 
     // Party B also deposits USDC
-    const depositAmountB = new BN(300_000); // Use smaller amount
+    const depositAmountB = new BN(300_000);
 
     await program.methods
       .deposit({ usdc: {} }, { sender: {} }, blockhashArray, depositAmountB)
@@ -3572,7 +3530,7 @@ describe("senda_dapp", () => {
         .cancel(blockhashArray)
         .accounts({
           escrow: escrowPda,
-          originalDepositor: partyA.publicKey, // Changed from 'depositor' to 'originalDepositor'
+          originalDepositor: partyA.publicKey,
           counterparty: partyB.publicKey,
           depositorUsdcAta: partyAUsdcAta,
           depositorUsdtAta: partyAUsdtAta,
@@ -3580,7 +3538,7 @@ describe("senda_dapp", () => {
           usdtMint: USDT_MINT_ADDR,
           vaultUsdc: vaultUsdc,
           vaultUsdt: vaultUsdt,
-          depositRecord: depositRecordB, // This belongs to partyB
+          depositRecord: depositRecordB,
           associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
           tokenProgram: TOKEN_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
@@ -3704,7 +3662,6 @@ describe("senda_dapp", () => {
 
     console.log("Transferred 1 USDC to both parties for same-token deposit test");
 
-    // Use a random seed to avoid account reuse issues
     const escrowSeed = new BN(randomBytes(8));
 
     const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
@@ -3752,7 +3709,6 @@ describe("senda_dapp", () => {
     // Create deposit record for partyA
     const [depositRecordA] = getDepositRecordPDA(escrowPda, partyA.publicKey, blockhashArray);
 
-    // Use smaller deposit amount
     const depositAmountA = new BN(300_000);
 
     // Party A deposits USDC
@@ -3896,7 +3852,7 @@ describe("senda_dapp", () => {
             USDC_MINT_ADDR,
             partyAUsdcAta,
             authority.publicKey,
-            500_000, // 0.5 USDC
+            500_000,
             usdcDecimals
           )
         )
@@ -3906,7 +3862,7 @@ describe("senda_dapp", () => {
             USDT_MINT_ADDR,
             partyBUsdtAta,
             authority.publicKey,
-            2_000_000_000, // 2 USDT
+            2_000_000_000,
             usdtDecimals
           )
         ),
@@ -3966,12 +3922,12 @@ describe("senda_dapp", () => {
     const [depositRecordB] = getDepositRecordPDA(escrowPda, partyB.publicKey, blockhashArray);
 
     // Have partyA deposit USDC
-    const depositAmountA = new BN(300_000); // 0.3 USDC with 6 decimals
+    const depositAmountA = new BN(300_000);
     const depositIxA = await program.methods
       .deposit(
         { usdc: {} },
         { both: {} },
-        blockhashArray,  // Pass the array directly
+        blockhashArray,
         depositAmountA
       )
       .accounts({
@@ -4004,7 +3960,7 @@ describe("senda_dapp", () => {
       .deposit(
         { usdt: {} },
         { both: {} },
-        blockhashArray,  // Pass the array directly
+        blockhashArray,
         depositAmountB
       )
       .accounts({
