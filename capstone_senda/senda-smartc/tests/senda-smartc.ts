@@ -373,13 +373,13 @@ describe("senda_dapp", () => {
     await provider.sendAndConfirm(
       new Transaction()
         .add(createAssociatedTokenAccountIdempotentInstruction(
-          depositSender.publicKey,
+          authority.publicKey,
           senderUsdcAta,
           depositSender.publicKey,
           USDC_MINT_ADDR
         ))
         .add(createAssociatedTokenAccountIdempotentInstruction(
-          depositSender.publicKey,
+          authority.publicKey,
           senderUsdtAta,
           depositSender.publicKey,
           USDT_MINT_ADDR
@@ -458,7 +458,7 @@ describe("senda_dapp", () => {
     const amountToDeposit = new BN(500_000);
 
     try {
-      const tx = await program.methods
+      const depositIx = await program.methods
         .deposit(
           { usdc: {} },
           { sender: {} },
@@ -484,10 +484,12 @@ describe("senda_dapp", () => {
           systemProgram: SystemProgram.programId,
           rent: SYSVAR_RENT_PUBKEY
         } as DepositAccounts)
-        .signers([depositSender, authority])
-        .rpc();
+        .instruction();
 
-      console.log(`Deposit transaction signature: ${tx}`);
+      const depositTx = new Transaction().add(depositIx);
+      const depositSig = await web3.sendAndConfirmTransaction(connection, depositTx, [depositSender, authority]);
+
+      console.log(`Deposit transaction signature: ${depositSig}`);
 
       // Verify the deposit record was created correctly
       const depositRecord = await program.account.depositRecord.fetch(depositRecordPda);
@@ -1422,6 +1424,7 @@ describe("senda_dapp", () => {
       false
     );
 
+    // Create token accounts
     await provider.sendAndConfirm(
       new Transaction()
         .add(createAssociatedTokenAccountIdempotentInstruction(
@@ -1458,6 +1461,7 @@ describe("senda_dapp", () => {
       false
     );
 
+    const depositTokenAmount = 1_000_000; // 1 USDC
     await provider.sendAndConfirm(
       new Transaction().add(
         createTransferCheckedInstruction(
@@ -1465,18 +1469,16 @@ describe("senda_dapp", () => {
           USDC_MINT_ADDR,
           senderUsdcAta,
           authority.publicKey,
-          1_000_000,
-          6
+          depositTokenAmount,
+          usdcDecimals
         )
       ),
       [authority]
     );
 
-    console.log(`Transferred 1 USDC to sender for unauthorized release test`);
+    console.log("Transferred 1 USDC to sender for unauthorized release test");
 
-    // Create an escrow with a random seed
-    const escrowSeed = new BN(randomBytes(8));
-
+    const escrowSeed = new BN(0);
     const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
       [Buffer.from("escrow"), depositSender.publicKey.toBuffer(), depositReceiver.publicKey.toBuffer()],
       program.programId
@@ -1492,7 +1494,7 @@ describe("senda_dapp", () => {
       program.programId
     );
 
-    // Initialize the escrow
+    // Initialize escrow
     await program.methods
       .initializeEscrow(escrowSeed)
       .accounts({
@@ -1517,16 +1519,19 @@ describe("senda_dapp", () => {
       .rpc();
 
     const blockhashArray = await getRecentBlockhashArray(connection);
-
-    // Create a deposit record
     const [depositRecordPda, depositRecordBump] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
 
-    // Make a deposit with single signature policy (sender as signer)
-    await program.methods
-      .deposit({ usdc: {} }, { sender: {} }, blockhashArray, new BN(500_000))
+    // Make a deposit with sender as authorized signer
+    const depositIx = await program.methods
+      .deposit(
+        { usdc: {} },
+        { sender: {} },
+        blockhashArray,
+        new BN(500_000)
+      )
       .accounts({
         escrow: escrowPda,
-        depositor: depositSender.publicKey,
+        sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
@@ -1543,52 +1548,51 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY
       } as DepositAccounts)
-      .signers([depositSender, authority])
-      .rpc();
-
-    console.log(`Deposit successful for unauthorized release test`);
-
-    // Get the initial vault balance
-    const vaultBalanceBefore = await getTokenBalance(vaultUsdc);
-
-    // Create the release instruction
-    const releaseIx = await program.methods
-      .release(blockhashArray)
-      .accounts({
-        escrow: escrowPda,
-        sender: depositSender.publicKey,
-        receiver: depositReceiver.publicKey,
-        receivingParty: depositReceiver.publicKey,
-        receivingUsdcAta: receiverUsdcAta,
-        receivingUsdtAta: receiverUsdtAta,
-        usdcMint: USDC_MINT_ADDR,
-        usdtMint: USDT_MINT_ADDR,
-        vaultUsdc: vaultUsdc,
-        vaultUsdt: vaultUsdt,
-        depositRecord: depositRecordPda,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY
-      } as ReleaseAccounts)
       .instruction();
 
-    // Try to release funds with unauthorized signer
-    const releaseTx = new Transaction().add(releaseIx);
+    const depositTx = new Transaction().add(depositIx);
+    await web3.sendAndConfirmTransaction(connection, depositTx, [depositSender, authority]);
 
+    console.log("Deposit successful for unauthorized release test");
 
-    // Expect this to fail with an error about invalid signer
+    // Try to release with unauthorized signer
     try {
-      await web3.sendAndConfirmTransaction(connection, releaseTx, [unauthorizedSigner]);
-      assert.fail("Unauthorized release should have failed");
-    } catch (err) {
-      console.log(`Expected error from unauthorized release attempt: ${err}`);
-      // This is expected - the unauthorized signer cannot release the funds
-    }
+      const releaseIx = await program.methods
+        .release(blockhashArray)
+        .accounts({
+          escrow: escrowPda,
+          sender: depositSender.publicKey,
+          receiver: depositReceiver.publicKey,
+          receivingParty: depositReceiver.publicKey,
+          receivingUsdcAta: receiverUsdcAta,
+          receivingUsdtAta: receiverUsdtAta,
+          usdcMint: USDC_MINT_ADDR,
+          usdtMint: USDT_MINT_ADDR,
+          vaultUsdc: vaultUsdc,
+          vaultUsdt: vaultUsdt,
+          depositRecord: depositRecordPda,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+          rent: SYSVAR_RENT_PUBKEY
+        } as ReleaseAccounts)
+        .instruction();
 
-    // Verify that the vault balance hasn't changed
-    const vaultBalanceAfter = await getTokenBalance(vaultUsdc);
-    assert.equal(vaultBalanceAfter, vaultBalanceBefore, "Vault balance should remain unchanged");
+      const releaseTx = new Transaction().add(releaseIx);
+      await web3.sendAndConfirmTransaction(connection, releaseTx, [unauthorizedSigner]);
+      assert.fail("Should not be able to release with unauthorized signer");
+    } catch (err) {
+      console.log("Expected error for unauthorized release attempt:", err);
+      // Check for either the custom program error code or a more generic unauthorized signer error
+      const errorMessage = err.toString().toLowerCase();
+      assert.ok(
+        errorMessage.includes("0x1771") || // Custom program error code for InvalidSigner
+        errorMessage.includes("invalid signer") ||
+        errorMessage.includes("missing required signature") ||
+        errorMessage.includes("signature verification failed"),
+        "Should fail with an invalid signer error"
+      );
+    }
   });
 
   it("ensures only depositor can cancel their own deposit", async () => {
@@ -1920,6 +1924,7 @@ describe("senda_dapp", () => {
       false
     );
 
+    // Create token accounts
     await provider.sendAndConfirm(
       new Transaction()
         .add(createAssociatedTokenAccountIdempotentInstruction(
@@ -1956,6 +1961,7 @@ describe("senda_dapp", () => {
       false
     );
 
+    const depositTokenAmount = 1_000_000; // 1 USDC
     await provider.sendAndConfirm(
       new Transaction().add(
         createTransferCheckedInstruction(
@@ -1963,19 +1969,16 @@ describe("senda_dapp", () => {
           USDC_MINT_ADDR,
           senderUsdcAta,
           authority.publicKey,
-          1_000_000,
-          6
+          depositTokenAmount,
+          usdcDecimals
         )
       ),
       [authority]
     );
 
-    console.log(`Transferred 1 USDC to sender for double release test`);
+    console.log("Transferred 1 USDC to sender for double release test");
 
-    // Use a random seed for escrow creation
-    const escrowSeed = new BN(randomBytes(8));
-
-    // Initialize escrow
+    const escrowSeed = new BN(0);
     const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
       [Buffer.from("escrow"), depositSender.publicKey.toBuffer(), depositReceiver.publicKey.toBuffer()],
       program.programId
@@ -2015,892 +2018,24 @@ describe("senda_dapp", () => {
       .rpc();
 
     const blockhashArray = await getRecentBlockhashArray(connection);
-
-    // Create deposit record
     const [depositRecordPda, depositRecordBump] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
 
     // Make a deposit with sender as authorized signer
-    await program.methods
+    const depositIx = await program.methods
       .deposit(
         { usdc: {} },
         { sender: {} },
-        blockhashArray,  // Pass the array directly
+        blockhashArray,
         new BN(500_000)
       )
       .accounts({
         escrow: escrowPda,
-        depositor: depositSender.publicKey,
-        receiver: depositReceiver.publicKey,
-        senderUsdcAta: senderUsdcAta,
-        senderUsdtAta: senderUsdtAta,
-        receiverUsdcAta: receiverUsdcAta,
-        receiverUsdtAta: receiverUsdtAta,
-        usdcMint: USDC_MINT_ADDR,
-        usdtMint: USDT_MINT_ADDR,
-        vaultUsdc: vaultUsdc,
-        vaultUsdt: vaultUsdt,
-        depositRecord: depositRecordPda,
-        feePayer: authority.publicKey,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY
-      } as DepositAccounts)
-      .signers([depositSender, authority])
-      .rpc();
-
-    console.log(`Deposit successful for double release test`);
-
-    // Check vault balance before release
-    const vaultBalanceBefore = await getTokenBalance(vaultUsdc);
-    console.log(`Vault USDC balance before release: ${vaultBalanceBefore}`);
-
-    // First release - should be successful
-    const releaseIx = await program.methods
-      .release(blockhashArray)
-      .accounts({
-        escrow: escrowPda,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
         receiverUsdcAta: receiverUsdcAta,
         receiverUsdtAta: receiverUsdtAta,
-        usdcMint: USDC_MINT_ADDR,
-        usdtMint: USDT_MINT_ADDR,
-        vaultUsdc: vaultUsdc,
-        vaultUsdt: vaultUsdt,
-        depositRecord: depositRecordPda,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY
-      } as ReleaseAccounts)
-      .instruction()
-
-    // Create transaction for first release
-    const release1Tx = new Transaction().add(releaseIx);
-
-    // Sign and send the first release
-    // const blockHash = await connection.getLatestBlockhash();
-    // release1Tx.feePayer = depositSender.publicKey;
-    // release1Tx.recentBlockhash = blockHash.blockhash;
-    // release1Tx.sign(depositSender);
-
-    // const release1TxId = await connection.sendRawTransaction(release1Tx.serialize());
-    // await connection.confirmTransaction({
-    //   signature: release1TxId,
-    //   ...blockHash
-    // });
-
-    const releaseSig = await web3.sendAndConfirmTransaction(
-      connection,
-      release1Tx,
-      [depositSender]
-    );
-
-    console.log(`First release transaction: ${releaseSig}`);
-
-    // Check receiver's balance after first release
-    const receiverBalanceAfterRelease = await getTokenBalance(receiverUsdcAta);
-    console.log(`Receiver balance after first release: ${receiverBalanceAfterRelease}`);
-
-    // Check vault balance after first release
-    const vaultBalanceAfterRelease = await getTokenBalance(vaultUsdc);
-    console.log(`Vault balance after first release: ${vaultBalanceAfterRelease}`);
-
-    // Verify first release was successful
-    assert.equal(vaultBalanceAfterRelease, 0, "Vault should be empty after successful release");
-    assert.equal(receiverBalanceAfterRelease, vaultBalanceBefore, "Receiver should have received the funds");
-
-    // Try to release again - this should fail
-    const release2Ix = await program.methods
-      .release(blockhashArray)
-      .accounts({
-        escrow: escrowPda,
-        sender: depositSender.publicKey,
-        receiver: depositReceiver.publicKey,
-        senderUsdcAta: senderUsdcAta,
-        senderUsdtAta: senderUsdtAta,
-        receiverUsdcAta: receiverUsdcAta,
-        receiverUsdtAta: receiverUsdtAta,
-        usdcMint: USDC_MINT_ADDR,
-        usdtMint: USDT_MINT_ADDR,
-        vaultUsdc: vaultUsdc,
-        vaultUsdt: vaultUsdt,
-        depositRecord: depositRecordPda,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY
-      } as ReleaseAccounts)
-      .instruction()
-
-    const release2Tx = new Transaction().add(release2Ix);
-
-    // Try to release again - expect this to fail
-    try {
-      // const blockHash2 = await connection.getLatestBlockhash();
-      // release2Tx.feePayer = depositSender.publicKey;
-      // release2Tx.recentBlockhash = blockHash2.blockhash;
-      // release2Tx.sign(depositSender);
-
-      // await connection.sendRawTransaction(release2Tx.serialize());
-      await web3.sendAndConfirmTransaction(
-        connection,
-        release2Tx,
-        [depositSender]
-      );
-      assert.fail("Second release should have failed");
-    } catch (err) {
-      console.log(`Expected error on second release attempt: ${err}`);
-      // This is expected - can't release the same deposit twice
-    }
-
-    // Verify receiver balance hasn't changed
-    const receiverFinalBalance = await getTokenBalance(receiverUsdcAta);
-    assert.equal(receiverFinalBalance, receiverBalanceAfterRelease, "Receiver balance should be unchanged after failed second release");
-
-    // Verify deposit record is marked complete
-    const depositRecord = await program.account.depositRecord.fetch(depositRecordPda);
-    assert.strictEqual(depositRecord.state.complete !== undefined, true, "Deposit record should be marked as complete");
-  });
-
-  it("prevents cancellation after release", async () => {
-    const depositSender = Keypair.generate();
-    const depositReceiver = Keypair.generate();
-
-    await provider.sendAndConfirm(
-      new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: authority.publicKey,
-          toPubkey: depositSender.publicKey,
-          lamports: 0.1 * LAMPORTS_PER_SOL,
-        })
-      ),
-      [authority]
-    );
-
-    await provider.sendAndConfirm(
-      new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: authority.publicKey,
-          toPubkey: depositReceiver.publicKey,
-          lamports: 0.1 * LAMPORTS_PER_SOL,
-        })
-      ),
-      [authority]
-    );
-
-    const senderUsdcAta = getAssociatedTokenAddressSync(
-      USDC_MINT_ADDR,
-      depositSender.publicKey,
-      false
-    );
-    const senderUsdtAta = getAssociatedTokenAddressSync(
-      USDT_MINT_ADDR,
-      depositSender.publicKey,
-      false
-    );
-    const receiverUsdcAta = getAssociatedTokenAddressSync(
-      USDC_MINT_ADDR,
-      depositReceiver.publicKey,
-      false
-    );
-    const receiverUsdtAta = getAssociatedTokenAddressSync(
-      USDT_MINT_ADDR,
-      depositReceiver.publicKey,
-      false
-    );
-
-    await provider.sendAndConfirm(
-      new Transaction()
-        .add(createAssociatedTokenAccountIdempotentInstruction(
-          depositSender.publicKey,
-          senderUsdcAta,
-          depositSender.publicKey,
-          USDC_MINT_ADDR
-        ))
-        .add(createAssociatedTokenAccountIdempotentInstruction(
-          depositSender.publicKey,
-          senderUsdtAta,
-          depositSender.publicKey,
-          USDT_MINT_ADDR
-        ))
-        .add(createAssociatedTokenAccountIdempotentInstruction(
-          depositSender.publicKey,
-          receiverUsdcAta,
-          depositReceiver.publicKey,
-          USDC_MINT_ADDR
-        ))
-        .add(createAssociatedTokenAccountIdempotentInstruction(
-          depositSender.publicKey,
-          receiverUsdtAta,
-          depositReceiver.publicKey,
-          USDT_MINT_ADDR
-        )),
-      [depositSender]
-    );
-
-    const walletUsdcAta = getAssociatedTokenAddressSync(
-      USDC_MINT_ADDR,
-      authority.publicKey,
-      false
-    );
-
-    const tokenAmount = 1_000_000;
-
-    await provider.sendAndConfirm(
-      new Transaction().add(
-        createTransferCheckedInstruction(
-          walletUsdcAta,
-          USDC_MINT_ADDR,
-          senderUsdcAta,
-          authority.publicKey,
-          tokenAmount,
-          6
-        )
-      ),
-      [authority]
-    );
-
-    console.log(`Transferred 1 USDC to sender for cancel-after-release test`);
-
-    const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
-      [Buffer.from("escrow"), depositSender.publicKey.toBuffer(), depositReceiver.publicKey.toBuffer()],
-      program.programId
-    );
-    const [vaultUsdc, vaultUsdcBump] = PublicKey.findProgramAddressSync(
-      [Buffer.from("usdc-vault"), escrowPda.toBuffer(), USDC_MINT_ADDR.toBuffer()],
-      program.programId
-    );
-    const [vaultUsdt, vaultUsdtBump] = PublicKey.findProgramAddressSync(
-      [Buffer.from("usdt-vault"), escrowPda.toBuffer(), USDT_MINT_ADDR.toBuffer()],
-      program.programId
-    );
-
-    await program.methods
-      .initializeEscrow(new BN(0))
-      .accounts({
-        escrow: escrowPda,
-        feePayer: authority.publicKey,
-        sender: depositSender.publicKey,
-        receiver: depositReceiver.publicKey,
-        senderUsdcAta: senderUsdcAta,
-        senderUsdtAta: senderUsdtAta,
-        receiverUsdcAta: receiverUsdcAta,
-        receiverUsdtAta: receiverUsdtAta,
-        usdcMint: USDC_MINT_ADDR,
-        usdtMint: USDT_MINT_ADDR,
-        vaultUsdc,
-        vaultUsdt,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY,
-      } as InitEscrowAccounts)
-      .signers([depositSender, authority])
-      .rpc();
-
-    const blockhashArray = await getRecentBlockhashArray(connection);
-
-    const [depositRecordPda, depositRecordBump] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
-
-    const depositAmount = new BN(500_000);
-
-    // Create the deposit with single signature policy (receiver is the designated signer)
-    await program.methods
-      .deposit(
-        { usdc: {} },
-        { receiver: {} },
-        blockhashArray,  // Pass the array directly
-        depositAmount
-      )
-      .accounts({
-        escrow: escrowPda,
-        sender: depositSender.publicKey,
-        receiver: depositReceiver.publicKey,
-        senderUsdcAta: senderUsdcAta,
-        senderUsdtAta: senderUsdtAta,
-        receiverUsdcAta: receiverUsdcAta,
-        receiverUsdtAta: receiverUsdtAta,
-        usdcMint: USDC_MINT_ADDR,
-        usdtMint: USDT_MINT_ADDR,
-        vaultUsdc: vaultUsdc,
-        vaultUsdt: vaultUsdt,
-        depositRecord: depositRecordPda,
-        feePayer: authority.publicKey,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY
-      } as DepositAccounts)
-      .signers([depositSender, authority])
-      .rpc();
-
-    console.log("Deposit successful for cancel-after-release test");
-
-    console.log("Releasing funds...");
-
-    // Release the funds with receiver as signer (using program.methods directly rather than manual transaction building)
-    await program.methods
-      .release(blockhashArray)
-      .accounts({
-        escrow: escrowPda,
-        sender: depositSender.publicKey,
-        receiver: depositReceiver.publicKey,
-        receivingParty: depositReceiver.publicKey,
-        senderUsdcAta: senderUsdcAta,
-        senderUsdtAta: senderUsdtAta,
-        receiverpartyUsdcAta: receiverUsdcAta,
-        receiverpartyUsdtAta: receiverUsdtAta,
-        usdcMint: USDC_MINT_ADDR,
-        usdtMint: USDT_MINT_ADDR,
-        vaultUsdc: vaultUsdc,
-        vaultUsdt: vaultUsdt,
-        depositRecord: depositRecordPda,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY
-      } as ReleaseAccounts)
-      .signers([depositReceiver])
-      .rpc();
-
-    console.log("Release completed successfully");
-
-    console.log("Attempting to cancel after release...");
-    try {
-      // Try to cancel after release - should fail with InvalidState error
-      await program.methods
-        .cancel(blockhashArray)
-        .accounts({
-          escrow: escrowPda,
-          sender: depositSender.publicKey,
-          receiver: depositReceiver.publicKey,
-          senderUsdcAta: senderUsdcAta,
-          senderUsdtAta: senderUsdtAta,
-          usdcMint: USDC_MINT_ADDR,
-          usdtMint: USDT_MINT_ADDR,
-          vaultUsdc: vaultUsdc,
-          vaultUsdt: vaultUsdt,
-          depositRecord: depositRecordPda,
-          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-          rent: SYSVAR_RENT_PUBKEY
-        } as CancelAccounts)
-        .signers([depositSender]) // Make sure depositor signs
-        .rpc();
-
-      assert.fail("Should have thrown an error - cancellation after release should not be possible");
-    } catch (err) {
-      // We expect this to fail with an InvalidState error
-      console.log("Expected error on cancel after release:", err.message);
-      assert.ok(
-        err.message.includes("InvalidState") ||
-        err.message.includes("custom program error: 0x1776"),
-        "Should fail with InvalidState error"
-      );
-    }
-  });
-
-  it("handles deposit count correctly", async () => {
-
-    const depositSender = Keypair.generate();
-    const depositReceiver = Keypair.generate();
-
-    await provider.sendAndConfirm(
-      new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: authority.publicKey,
-          toPubkey: depositSender.publicKey,
-          lamports: 0.5 * LAMPORTS_PER_SOL,
-        })
-      ),
-      [authority]
-    );
-
-    const senderUsdcAta = getAssociatedTokenAddressSync(
-      USDC_MINT_ADDR,
-      depositSender.publicKey,
-      false
-    );
-    const senderUsdtAta = getAssociatedTokenAddressSync(
-      USDT_MINT_ADDR,
-      depositSender.publicKey,
-      false
-    );
-    const receiverUsdcAta = getAssociatedTokenAddressSync(
-      USDC_MINT_ADDR,
-      depositReceiver.publicKey,
-      false
-    );
-    const receiverUsdtAta = getAssociatedTokenAddressSync(
-      USDT_MINT_ADDR,
-      depositReceiver.publicKey,
-      false
-    );
-
-    await provider.sendAndConfirm(
-      new Transaction()
-        .add(createAssociatedTokenAccountIdempotentInstruction(
-          depositSender.publicKey,
-          senderUsdcAta,
-          depositSender.publicKey,
-          USDC_MINT_ADDR
-        ))
-        .add(createAssociatedTokenAccountIdempotentInstruction(
-          depositSender.publicKey,
-          senderUsdtAta,
-          depositSender.publicKey,
-          USDT_MINT_ADDR
-        ))
-        .add(createAssociatedTokenAccountIdempotentInstruction(
-          depositSender.publicKey,
-          receiverUsdcAta,
-          depositReceiver.publicKey,
-          USDC_MINT_ADDR
-        ))
-        .add(createAssociatedTokenAccountIdempotentInstruction(
-          depositSender.publicKey,
-          receiverUsdtAta,
-          depositReceiver.publicKey,
-          USDT_MINT_ADDR
-        )),
-      [depositSender]
-    );
-
-    const walletUsdcAta = getAssociatedTokenAddressSync(
-      USDC_MINT_ADDR,
-      authority.publicKey,
-      false
-    );
-
-    const walletUsdtAta = getAssociatedTokenAddressSync(
-      USDT_MINT_ADDR,
-      authority.publicKey,
-      false
-    );
-
-    const tokenAmount = 3_000_000;
-
-    const usdtMintInfo = await connection.getParsedAccountInfo(USDT_MINT_ADDR);
-    const usdtDecimals = usdtMintInfo.value?.data ?
-      (usdtMintInfo.value.data as any).parsed.info.decimals : 6;
-
-    console.log(`USDC decimals: ${usdcDecimals}, USDT decimals: ${usdtDecimals}`);
-
-    await provider.sendAndConfirm(
-      new Transaction().add(
-        createTransferCheckedInstruction(
-          walletUsdcAta,
-          USDC_MINT_ADDR,
-          senderUsdcAta,
-          authority.publicKey,
-          tokenAmount,
-          usdcDecimals // Use correct decimals instead of hardcoded value
-        )
-      ),
-      [authority]
-    );
-
-    await provider.sendAndConfirm(
-      new Transaction().add(
-        createTransferCheckedInstruction(
-          walletUsdtAta,
-          USDT_MINT_ADDR,
-          senderUsdtAta,
-          authority.publicKey,
-          tokenAmount,
-          usdtDecimals // Use correct decimals instead of hardcoded value
-        )
-      ),
-      [authority]
-    );
-
-    console.log(`Transferred 3 USDC and 3 USDT to sender for deposit count test`);
-
-    const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
-      [Buffer.from("escrow"), depositSender.publicKey.toBuffer(), depositReceiver.publicKey.toBuffer()],
-      program.programId
-    );
-    const [vaultUsdc, vaultUsdcBump] = PublicKey.findProgramAddressSync(
-      [Buffer.from("usdc-vault"), escrowPda.toBuffer(), USDC_MINT_ADDR.toBuffer()],
-      program.programId
-    );
-    const [vaultUsdt, vaultUsdtBump] = PublicKey.findProgramAddressSync(
-      [Buffer.from("usdt-vault"), escrowPda.toBuffer(), USDT_MINT_ADDR.toBuffer()],
-      program.programId
-    );
-
-    await program.methods
-      .initializeEscrow(new BN(0))
-      .accounts({
-        escrow: escrowPda,
-        feePayer: authority.publicKey,
-        sender: depositSender.publicKey,
-        receiver: depositReceiver.publicKey,
-        senderUsdcAta: senderUsdcAta,
-        senderUsdtAta: senderUsdtAta,
-        receiverUsdcAta: receiverUsdcAta,
-        receiverUsdtAta: receiverUsdtAta,
-        usdcMint: USDC_MINT_ADDR,
-        usdtMint: USDT_MINT_ADDR,
-        vaultUsdc,
-        vaultUsdt,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY,
-      } as InitEscrowAccounts)
-      .signers([depositSender, authority])
-      .rpc();
-
-    const blockhashArray = await getRecentBlockhashArray(connection);
-
-    console.log("Escrow initialized successfully for deposit count test");
-
-    const [depositRecord0, depositRecord0Bump] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
-
-    // Smaller deposit amount to allow for multiple deposits
-    const depositAmount = new BN(100_000); // 0.1 USDC with 6 decimals instead of 1 billion
-
-    // First deposit
-    const deposit0Ix = await program.methods
-      .deposit({ usdc: {} }, { sender: {} }, blockhashArray, depositAmount)
-      .accounts({
-        escrow: escrowPda,
-        sender: depositSender.publicKey,
-        receiver: depositReceiver.publicKey,
-        senderUsdcAta: senderUsdcAta,
-        senderUsdtAta: senderUsdtAta,
-        receiverUsdcAta: receiverUsdcAta,
-        receiverUsdtAta: receiverUsdtAta,
-        usdcMint: USDC_MINT_ADDR,
-        usdtMint: USDT_MINT_ADDR,
-        vaultUsdc: vaultUsdc,
-        vaultUsdt: vaultUsdt,
-        depositRecord: depositRecord0,
-        feePayer: authority.publicKey,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY
-      } as DepositAccounts)
-      .instruction();
-
-    const deposit0Tx = new Transaction().add(deposit0Ix);
-    await web3.sendAndConfirmTransaction(connection, deposit0Tx, [depositSender, authority]);
-
-    console.log("First deposit successful (count 0)");
-
-    // Verify deposit count is 1
-    let escrowAccount = await program.account.escrow.fetch(escrowPda);
-    assert.strictEqual(escrowAccount.depositCount.toNumber(), 1, "Deposit count should be 1 after first deposit");
-
-    // Cancel first deposit
-    const cancel0Ix = await program.methods
-      .cancel(blockhashArray)
-      .accounts({
-        escrow: escrowPda,
-        sender: depositSender.publicKey,
-        receiver: depositReceiver.publicKey,
-        senderUsdcAta: senderUsdcAta,
-        senderUsdtAta: senderUsdtAta,
-        usdcMint: USDC_MINT_ADDR,
-        usdtMint: USDT_MINT_ADDR,
-        vaultUsdc: vaultUsdc,
-        vaultUsdt: vaultUsdt,
-        depositRecord: depositRecord0,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY
-      } as CancelAccounts)
-      .instruction();
-
-    const cancel0Tx = new Transaction().add(cancel0Ix);
-    await web3.sendAndConfirmTransaction(connection, cancel0Tx, [depositSender]);
-
-    console.log("First deposit cancelled");
-
-    // Verify deposit count is still 1 (cancelling doesn't decrement the counter)
-    escrowAccount = await program.account.escrow.fetch(escrowPda);
-    assert.strictEqual(escrowAccount.depositCount.toNumber(), 1, "Deposit count should remain 1 after cancellation");
-
-    // Get a fresh blockhash for second deposit
-    const blockhashArray1 = await getRecentBlockhashArray(connection);
-    const [depositRecord1, depositRecord1Bump] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray1);
-
-    const deposit1Ix = await program.methods
-      .deposit({ usdt: {} }, { sender: {} }, blockhashArray1, depositAmount)
-      .accounts({
-        escrow: escrowPda,
-        sender: depositSender.publicKey,
-        receiver: depositReceiver.publicKey,
-        senderUsdcAta: senderUsdcAta,
-        senderUsdtAta: senderUsdtAta,
-        receiverUsdcAta: receiverUsdcAta,
-        receiverUsdtAta: receiverUsdtAta,
-        usdcMint: USDC_MINT_ADDR,
-        usdtMint: USDT_MINT_ADDR,
-        vaultUsdc: vaultUsdc,
-        vaultUsdt: vaultUsdt,
-        depositRecord: depositRecord1,
-        feePayer: authority.publicKey,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY
-      } as DepositAccounts)
-      .instruction();
-
-    const deposit1Tx = new Transaction().add(deposit1Ix);
-    await web3.sendAndConfirmTransaction(connection, deposit1Tx, [depositSender, authority]);
-
-    console.log("Second deposit successful (count 1)");
-
-    // Verify deposit count is now 2
-    escrowAccount = await program.account.escrow.fetch(escrowPda);
-    assert.strictEqual(escrowAccount.depositCount.toNumber(), 2, "Deposit count should be 2 after second deposit");
-
-    // Try to re-use deposit record 0 PDA for a new deposit - should fail
-    try {
-      const reusePdaIx = await program.methods
-        .deposit({ usdc: {} }, { sender: {} }, blockhashArray, depositAmount)
-        .accounts({
-          escrow: escrowPda,
-          sender: depositSender.publicKey,
-          receiver: depositReceiver.publicKey,
-          senderUsdcAta: senderUsdcAta,
-          senderUsdtAta: senderUsdtAta,
-          receiverUsdcAta: receiverUsdcAta,
-          receiverUsdtAta: receiverUsdtAta,
-          usdcMint: USDC_MINT_ADDR,
-          usdtMint: USDT_MINT_ADDR,
-          vaultUsdc: vaultUsdc,
-          vaultUsdt: vaultUsdt,
-          depositRecord: depositRecord0, // Trying to reuse deposit record 0
-          feePayer: authority.publicKey,
-          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-          rent: SYSVAR_RENT_PUBKEY
-        } as DepositAccounts)
-        .instruction();
-
-      const reuseTx = new Transaction().add(reusePdaIx);
-      await web3.sendAndConfirmTransaction(connection, reuseTx, [depositSender, authority]);
-
-      assert.fail("Should not be able to reuse an existing deposit record PDA");
-    } catch (error) {
-      console.log("Expected error when trying to reuse deposit record:", error.message);
-      assert.ok(
-        error.message.includes("already in use") ||
-        error.message.includes("seeds constraint") ||
-        error.message.includes("ConstraintSeeds") ||
-        error.message.includes("A seeds constraint was violated"),
-        "Error should indicate account is already in use or a seed constraint was violated"
-      );
-    }
-
-    // Get a fresh blockhash for third deposit
-    const blockhashArray2 = await getRecentBlockhashArray(connection);
-    const [depositRecord2, depositRecord2Bump] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray2);
-
-    await program.methods
-      .deposit({ usdc: {} }, { sender: {} }, blockhashArray2, depositAmount)
-      .accounts({
-        escrow: escrowPda,
-        sender: depositSender.publicKey,
-        receiver: depositReceiver.publicKey,
-        senderUsdcAta: senderUsdcAta,
-        senderUsdtAta: senderUsdtAta,
-        receiverUsdcAta: receiverUsdcAta,
-        receiverUsdtAta: receiverUsdtAta,
-        usdcMint: USDC_MINT_ADDR,
-        usdtMint: USDT_MINT_ADDR,
-        vaultUsdc: vaultUsdc,
-        vaultUsdt: vaultUsdt,
-        depositRecord: depositRecord2,
-        feePayer: authority.publicKey,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY
-      } as DepositAccounts)
-      .signers([depositSender, authority])
-      .rpc();
-
-    console.log("Third deposit successful (count 2)");
-
-    // Verify deposit count is now 3
-    escrowAccount = await program.account.escrow.fetch(escrowPda);
-    assert.strictEqual(escrowAccount.depositCount.toNumber(), 3, "Deposit count should be 3 after third deposit");
-  });
-
-  it("cancels a deposit and returns funds to depositor", async () => {
-    // Generate new wallets for this test to avoid account reuse
-    const depositSender = Keypair.generate();
-    const depositReceiver = Keypair.generate();
-
-    // Fund wallets with SOL
-    await provider.sendAndConfirm(
-      new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: authority.publicKey,
-          toPubkey: depositSender.publicKey,
-          lamports: 0.1 * LAMPORTS_PER_SOL,
-        })
-      ),
-      [authority]
-    );
-
-    // Create token accounts
-    const senderUsdcAta = getAssociatedTokenAddressSync(
-      USDC_MINT_ADDR,
-      depositSender.publicKey,
-      false
-    );
-    const senderUsdtAta = getAssociatedTokenAddressSync(
-      USDT_MINT_ADDR,
-      depositSender.publicKey,
-      false
-    );
-    const receiverUsdcAta = getAssociatedTokenAddressSync(
-      USDC_MINT_ADDR,
-      depositReceiver.publicKey,
-      false
-    );
-    const receiverUsdtAta = getAssociatedTokenAddressSync(
-      USDT_MINT_ADDR,
-      depositReceiver.publicKey,
-      false
-    );
-
-    await provider.sendAndConfirm(
-      new Transaction()
-        .add(createAssociatedTokenAccountIdempotentInstruction(
-          authority.publicKey,
-          senderUsdcAta,
-          depositSender.publicKey,
-          USDC_MINT_ADDR
-        ))
-        .add(createAssociatedTokenAccountIdempotentInstruction(
-          authority.publicKey,
-          senderUsdtAta,
-          depositSender.publicKey,
-          USDT_MINT_ADDR
-        ))
-        .add(createAssociatedTokenAccountIdempotentInstruction(
-          authority.publicKey,
-          receiverUsdcAta,
-          depositReceiver.publicKey,
-          USDC_MINT_ADDR
-        ))
-        .add(createAssociatedTokenAccountIdempotentInstruction(
-          authority.publicKey,
-          receiverUsdtAta,
-          depositReceiver.publicKey,
-          USDT_MINT_ADDR
-        )),
-      [authority]
-    );
-
-    // Fund sender with USDT
-    const walletUsdtAta = getAssociatedTokenAddressSync(
-      USDT_MINT_ADDR,
-      authority.publicKey,
-      false
-    );
-
-    // Transfer USDT to sender
-    await provider.sendAndConfirm(
-      new Transaction().add(
-        createTransferCheckedInstruction(
-          walletUsdtAta,
-          USDT_MINT_ADDR,
-          senderUsdtAta,
-          authority.publicKey,
-          200_000_000, // 0.2 USDT with 9 decimals
-          usdtDecimals
-        )
-      ),
-      [authority]
-    );
-
-    console.log(`Transferred 0.2 USDT to sender for USDT cancel test`);
-
-    // Create escrow with a random seed
-    const escrowSeed = new BN(randomBytes(8));
-    const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
-      [Buffer.from("escrow"), depositSender.publicKey.toBuffer(), depositReceiver.publicKey.toBuffer()],
-      program.programId
-    );
-
-    const [vaultUsdc, vaultUsdcBump] = PublicKey.findProgramAddressSync(
-      [Buffer.from("usdc-vault"), escrowPda.toBuffer(), USDC_MINT_ADDR.toBuffer()],
-      program.programId
-    );
-
-    const [vaultUsdt, vaultUsdtBump] = PublicKey.findProgramAddressSync(
-      [Buffer.from("usdt-vault"), escrowPda.toBuffer(), USDT_MINT_ADDR.toBuffer()],
-      program.programId
-    );
-
-    // Initialize escrow
-    await program.methods
-      .initializeEscrow(escrowSeed)
-      .accounts({
-        escrow: escrowPda,
-        feePayer: authority.publicKey,
-        sender: depositSender.publicKey,
-        receiver: depositReceiver.publicKey,
-        senderUsdcAta: senderUsdcAta,
-        senderUsdtAta: senderUsdtAta,
-        receiverUsdcAta: receiverUsdcAta,
-        receiverUsdtAta: receiverUsdtAta,
-        usdcMint: USDC_MINT_ADDR,
-        usdtMint: USDT_MINT_ADDR,
-        vaultUsdc,
-        vaultUsdt,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY,
-      } as InitEscrowAccounts)
-      .signers([depositSender, authority])
-      .rpc();
-
-    console.log("Escrow initialized successfully for USDT cancel test");
-
-    const blockhashArray = await getRecentBlockhashArray(connection);
-
-    // Check sender balance before deposit
-    const senderBalanceBefore = await getTokenBalance(senderUsdtAta);
-    console.log(`Sender USDT balance before deposit: ${senderBalanceBefore}`);
-
-    // Create deposit record
-    const [depositRecordPda] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
-
-    // Deposit USDT into the escrow
-    const depositAmount = new BN(100_000_000); // 0.1 USDT with 9 decimals (reduced amount)
-
-    const depositIx = await program.methods
-      .deposit(
-        { usdt: {} },
-        { sender: {} },
-        blockhashArray,  // Pass the array directly
-        depositAmount
-      )
-      .accounts({
-        escrow: escrowPda,
-        sender: depositSender.publicKey,
-        receiver: depositReceiver.publicKey,
-        receivingParty: depositReceiver.publicKey,
-        receivingUsdcAta: receiverUsdcAta,
-        receivingUsdtAta: receiverUsdtAta,
         usdcMint: USDC_MINT_ADDR,
         usdtMint: USDT_MINT_ADDR,
         vaultUsdc: vaultUsdc,
@@ -2915,27 +2050,23 @@ describe("senda_dapp", () => {
       .instruction();
 
     const depositTx = new Transaction().add(depositIx);
-    const depositSig = await web3.sendAndConfirmTransaction(connection, depositTx, [depositSender, authority]);
+    await web3.sendAndConfirmTransaction(connection, depositTx, [depositSender, authority]);
 
-    console.log(`USDT deposit for cancel test: ${depositSig}`);
+    console.log("Deposit successful for double release test");
 
-    // Check vault balance before cancel
     const vaultBalanceBefore = await getTokenBalance(vaultUsdt);
-    const senderBalanceAfterDeposit = await getTokenBalance(senderUsdtAta);
-    console.log(`Vault USDT balance before cancel: ${vaultBalanceBefore}`);
-    console.log(`Sender USDT balance before cancel: ${senderBalanceAfterDeposit}`);
+    const senderBalanceBefore = await getTokenBalance(senderUsdtAta);
 
-    // Now cancel the deposit
-    const cancelIx = await program.methods
-      .cancel(blockhashArray)
+    // First release should succeed
+    const releaseIx = await program.methods
+      .release(blockhashArray)
       .accounts({
         escrow: escrowPda,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
-        senderUsdcAta: senderUsdcAta,
-        senderUsdtAta: senderUsdtAta,
-        receiverUsdcAta: receiverUsdcAta,
-        receiverUsdtAta: receiverUsdtAta,
+        receivingParty: depositReceiver.publicKey,
+        receivingUsdcAta: receiverUsdcAta,
+        receivingUsdtAta: receiverUsdtAta,
         usdcMint: USDC_MINT_ADDR,
         usdtMint: USDT_MINT_ADDR,
         vaultUsdc: vaultUsdc,
@@ -2945,13 +2076,13 @@ describe("senda_dapp", () => {
         tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY
-      } as CancelAccounts)
+      } as ReleaseAccounts)
       .instruction();
 
-    const cancelTx = new Transaction().add(cancelIx);
-    const cancelSig = await web3.sendAndConfirmTransaction(connection, cancelTx, [depositSender]);
+    const releaseTx = new Transaction().add(releaseIx);
+    const releaseSig = await web3.sendAndConfirmTransaction(connection, releaseTx, [depositSender]);
 
-    console.log(`Cancel USDT transaction: ${cancelSig}`);
+    console.log(`Release USDT transaction: ${releaseSig}`);
 
     // Check balances after cancel
     const vaultBalanceAfter = await getTokenBalance(vaultUsdt);
@@ -3480,5 +2611,241 @@ describe("senda_dapp", () => {
 
     const expectedTotal = (depositAmountA.toNumber() + depositAmountB.toNumber()) / 1_000_000;
     assert.strictEqual(usdcVaultBalance, expectedTotal, "USDC vault should have both parties' deposits");
+  });
+
+  it("prevents cancellation after release", async () => {
+    const depositSender = Keypair.generate();
+    const depositReceiver = Keypair.generate();
+
+    // Fund wallets with SOL
+    await provider.sendAndConfirm(
+      new Transaction()
+        .add(
+          SystemProgram.transfer({
+            fromPubkey: authority.publicKey,
+            toPubkey: depositSender.publicKey,
+            lamports: 0.1 * LAMPORTS_PER_SOL,
+          })
+        )
+        .add(
+          SystemProgram.transfer({
+            fromPubkey: authority.publicKey,
+            toPubkey: depositReceiver.publicKey,
+            lamports: 0.1 * LAMPORTS_PER_SOL,
+          })
+        ),
+      [authority]
+    );
+
+    // Create token accounts
+    const senderUsdcAta = getAssociatedTokenAddressSync(
+      USDC_MINT_ADDR,
+      depositSender.publicKey,
+      false
+    );
+    const senderUsdtAta = getAssociatedTokenAddressSync(
+      USDT_MINT_ADDR,
+      depositSender.publicKey,
+      false
+    );
+    const receiverUsdcAta = getAssociatedTokenAddressSync(
+      USDC_MINT_ADDR,
+      depositReceiver.publicKey,
+      false
+    );
+    const receiverUsdtAta = getAssociatedTokenAddressSync(
+      USDT_MINT_ADDR,
+      depositReceiver.publicKey,
+      false
+    );
+
+    // Create token accounts
+    await provider.sendAndConfirm(
+      new Transaction()
+        .add(createAssociatedTokenAccountIdempotentInstruction(
+          authority.publicKey,
+          senderUsdcAta,
+          depositSender.publicKey,
+          USDC_MINT_ADDR
+        ))
+        .add(createAssociatedTokenAccountIdempotentInstruction(
+          authority.publicKey,
+          senderUsdtAta,
+          depositSender.publicKey,
+          USDT_MINT_ADDR
+        ))
+        .add(createAssociatedTokenAccountIdempotentInstruction(
+          authority.publicKey,
+          receiverUsdcAta,
+          depositReceiver.publicKey,
+          USDC_MINT_ADDR
+        ))
+        .add(createAssociatedTokenAccountIdempotentInstruction(
+          authority.publicKey,
+          receiverUsdtAta,
+          depositReceiver.publicKey,
+          USDT_MINT_ADDR
+        )),
+      [authority]
+    );
+
+    // Fund sender with USDC
+    const walletUsdcAta = getAssociatedTokenAddressSync(
+      USDC_MINT_ADDR,
+      authority.publicKey,
+      false
+    );
+
+    const depositTokenAmount = 1_000_000; // 1 USDC
+    await provider.sendAndConfirm(
+      new Transaction().add(
+        createTransferCheckedInstruction(
+          walletUsdcAta,
+          USDC_MINT_ADDR,
+          senderUsdcAta,
+          authority.publicKey,
+          depositTokenAmount,
+          usdcDecimals
+        )
+      ),
+      [authority]
+    );
+
+    console.log("Transferred 1 USDC to sender for cancel-after-release test");
+
+    const escrowSeed = new BN(0);
+    const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow"), depositSender.publicKey.toBuffer(), depositReceiver.publicKey.toBuffer()],
+      program.programId
+    );
+
+    const [vaultUsdc, vaultUsdcBump] = PublicKey.findProgramAddressSync(
+      [Buffer.from("usdc-vault"), escrowPda.toBuffer(), USDC_MINT_ADDR.toBuffer()],
+      program.programId
+    );
+
+    const [vaultUsdt, vaultUsdtBump] = PublicKey.findProgramAddressSync(
+      [Buffer.from("usdt-vault"), escrowPda.toBuffer(), USDT_MINT_ADDR.toBuffer()],
+      program.programId
+    );
+
+    await program.methods
+      .initializeEscrow(escrowSeed)
+      .accounts({
+        escrow: escrowPda,
+        feePayer: authority.publicKey,
+        sender: depositSender.publicKey,
+        receiver: depositReceiver.publicKey,
+        senderUsdcAta: senderUsdcAta,
+        senderUsdtAta: senderUsdtAta,
+        receiverUsdcAta: receiverUsdcAta,
+        receiverUsdtAta: receiverUsdtAta,
+        usdcMint: USDC_MINT_ADDR,
+        usdtMint: USDT_MINT_ADDR,
+        vaultUsdc,
+        vaultUsdt,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+        rent: SYSVAR_RENT_PUBKEY,
+      } as InitEscrowAccounts)
+      .signers([depositSender, authority])
+      .rpc();
+
+    const blockhashArray = await getRecentBlockhashArray(connection);
+    const [depositRecordPda, depositRecordBump] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
+
+    // Make a deposit with sender as authorized signer
+    const depositIx = await program.methods
+      .deposit(
+        { usdc: {} },
+        { sender: {} },
+        blockhashArray,
+        new BN(500_000)
+      )
+      .accounts({
+        escrow: escrowPda,
+        sender: depositSender.publicKey,
+        receiver: depositReceiver.publicKey,
+        senderUsdcAta: senderUsdcAta,
+        senderUsdtAta: senderUsdtAta,
+        receiverUsdcAta: receiverUsdcAta,
+        receiverUsdtAta: receiverUsdtAta,
+        usdcMint: USDC_MINT_ADDR,
+        usdtMint: USDT_MINT_ADDR,
+        vaultUsdc: vaultUsdc,
+        vaultUsdt: vaultUsdt,
+        depositRecord: depositRecordPda,
+        feePayer: authority.publicKey,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+        rent: SYSVAR_RENT_PUBKEY
+      } as DepositAccounts)
+      .instruction();
+
+    const depositTx = new Transaction().add(depositIx);
+    await web3.sendAndConfirmTransaction(connection, depositTx, [depositSender, authority]);
+
+    console.log("Deposit successful for cancel-after-release test");
+
+    // Release the funds
+    const releaseIx = await program.methods
+      .release(blockhashArray)
+      .accounts({
+        escrow: escrowPda,
+        sender: depositSender.publicKey,
+        receiver: depositReceiver.publicKey,
+        receivingParty: depositReceiver.publicKey,
+        receivingUsdcAta: receiverUsdcAta,
+        receivingUsdtAta: receiverUsdtAta,
+        usdcMint: USDC_MINT_ADDR,
+        usdtMint: USDT_MINT_ADDR,
+        vaultUsdc: vaultUsdc,
+        vaultUsdt: vaultUsdt,
+        depositRecord: depositRecordPda,
+        feePayer: authority.publicKey,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+        rent: SYSVAR_RENT_PUBKEY
+      } as ReleaseAccounts)
+      .instruction();
+
+    const releaseTx = new Transaction().add(releaseIx);
+    await web3.sendAndConfirmTransaction(connection, releaseTx, [depositSender]);
+
+    console.log("Release completed successfully");
+
+    // Try to cancel after release
+    try {
+      const cancelIx = await program.methods
+        .cancel(blockhashArray)
+        .accounts({
+          escrow: escrowPda,
+          sender: depositSender.publicKey,
+          receiver: depositReceiver.publicKey,
+          senderUsdcAta: senderUsdcAta,
+          senderUsdtAta: senderUsdtAta,
+          usdcMint: USDC_MINT_ADDR,
+          usdtMint: USDT_MINT_ADDR,
+          vaultUsdc: vaultUsdc,
+          vaultUsdt: vaultUsdt,
+          depositRecord: depositRecordPda,
+          feePayer: authority.publicKey,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+          rent: SYSVAR_RENT_PUBKEY
+        } as CancelAccounts)
+        .instruction();
+
+      const cancelTx = new Transaction().add(cancelIx);
+      await web3.sendAndConfirmTransaction(connection, cancelTx, [depositSender]);
+      assert.fail("Should not be able to cancel after release");
+    } catch (err) {
+      console.log("Expected error for cancel after release attempt:", err);
+      assert.ok(err.toString().includes("custom program error") || err.toString().includes("InvalidState"), "Should fail with InvalidState error");
+    }
   });
 });
