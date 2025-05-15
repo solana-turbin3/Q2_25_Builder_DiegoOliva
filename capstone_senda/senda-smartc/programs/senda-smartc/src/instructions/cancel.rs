@@ -6,7 +6,7 @@ use anchor_spl::{
 };
 
 use crate::error::ErrorCode;
-use crate::state::{Escrow, DepositState, DepositRecord, EscrowState, Stable};
+use crate::state::{Escrow, DepositState, DepositRecord, Stable};
 
 #[derive(Accounts)]
 #[instruction(recent_blockhash: [u8; 32])]
@@ -14,42 +14,27 @@ pub struct Cancel<'info> {
     #[account(mut, seeds = [b"escrow", escrow.sender.as_ref(), escrow.receiver.as_ref()], bump = escrow.bump)]
     pub escrow: Box<Account<'info, Escrow>>,
 
-    /// CHECK: Storing pk to keep track
+    /// CHECK: Sender of the escrow
     #[account(mut)]
-    pub original_depositor: AccountInfo<'info>,
+    pub sender: AccountInfo<'info>,
 
+    /// CHECK: Receiver of the escrow
     #[account(mut)]
-    pub signer: Signer<'info>,
+    pub receiver: AccountInfo<'info>,
 
     #[account(
         mut,
         associated_token::mint = usdc_mint,
-        associated_token::authority = original_depositor,
+        associated_token::authority = sender,
     )]
     pub sender_usdc_ata: Box<Account<'info, SplTokenAccount>>,
 
     #[account(
         mut,
         associated_token::mint = usdt_mint,
-        associated_token::authority = original_depositor,
+        associated_token::authority = sender,
     )]
     pub sender_usdt_ata: Box<Account<'info, SplTokenAccount>>,
-
-    #[account(
-        mut,
-        associated_token::mint = usdc_mint,
-        associated_token::authority = escrow.receiver,
-        associated_token::token_program = token_program
-    )]
-    pub receiver_usdc_ata: Box<Account<'info, SplTokenAccount>>,
-
-    #[account(
-        mut,
-        associated_token::mint = usdt_mint,
-        associated_token::authority = escrow.receiver,
-        associated_token::token_program = token_program
-    )]
-    pub receiver_usdt_ata: Box<Account<'info, SplTokenAccount>>,
 
     #[account(mint::token_program = token_program)]
     pub usdc_mint: Box<Account<'info, SplMint>>,
@@ -82,7 +67,7 @@ pub struct Cancel<'info> {
         seeds = [
             b"deposit",
             escrow.key().as_ref(),
-            original_depositor.key().as_ref(),
+            sender.key().as_ref(),
             recent_blockhash.as_ref()
         ],
         bump = deposit_record.bump,
@@ -96,22 +81,18 @@ pub struct Cancel<'info> {
 }
 
 impl<'info> Cancel<'info> {
-    
     pub fn cancel(&mut self, _recent_blockhash: [u8; 32]) -> Result<()> {
-        // 1. Verify the escrow is active
+
         require!(
-            self.escrow.state == EscrowState::Active,
+            self.deposit_record.state == DepositState::PendingWithdrawal,
             ErrorCode::InvalidState
         );
 
+        // Only the original depositor (sender) can cancel
         require!(
-            self.signer.key() == self.original_depositor.key(),
-            ErrorCode::InvalidDepositor
+            self.sender.is_signer,
+            ErrorCode::InvalidSigner
         );
-
-        let is_sender = self.original_depositor.key() == self.escrow.sender;
-        let is_receiver = self.original_depositor.key() == self.escrow.receiver;
-        require!(is_sender || is_receiver, ErrorCode::InvalidDepositor);
         
         let (amount, mint, vault, decimals) = if self.deposit_record.stable == Stable::Usdc {
             (
