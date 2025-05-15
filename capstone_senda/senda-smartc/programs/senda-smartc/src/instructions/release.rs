@@ -18,48 +18,31 @@ pub struct Release<'info> {
     )]
     pub escrow: Account<'info, Escrow>,
 
-    /// CHECK: Storing pk to keep track
+    /// CHECK: Sender of the escrow
     #[account(mut)]
-    pub original_depositor: AccountInfo<'info>,
+    pub sender: AccountInfo<'info>,
     
-    /// CHECK: Storing pk to keep track
+    /// CHECK: Receiver of the escrow
     #[account(mut)]
-    pub counterparty: AccountInfo<'info>,
+    pub receiver: AccountInfo<'info>,
 
-    #[account(mut)]
-    pub authorized_signer: Signer<'info>,
-
-    /// CHECK: Storing pk to keep track
+    /// CHECK: Account that will receive the funds
     #[account(mut)]
     pub receiving_party: AccountInfo<'info>,
 
     #[account(
         mut,
         associated_token::mint = usdc_mint,
-        associated_token::authority = original_depositor,
+        associated_token::authority = receiving_party,
     )]
-    pub depositor_usdc_ata: Box<Account<'info, SplTokenAccount>>,
+    pub receiving_usdc_ata: Box<Account<'info, SplTokenAccount>>,
 
     #[account(
         mut,
         associated_token::mint = usdt_mint,
-        associated_token::authority = original_depositor,
+        associated_token::authority = receiving_party,
     )]
-    pub depositor_usdt_ata: Box<Account<'info, SplTokenAccount>>,
-
-    #[account(
-        mut,
-        associated_token::mint = usdc_mint,
-        associated_token::authority = counterparty,
-    )]
-    pub counterparty_usdc_ata: Box<Account<'info, SplTokenAccount>>,
-
-    #[account(
-        mut,
-        associated_token::mint = usdt_mint,
-        associated_token::authority = counterparty,
-    )]
-    pub counterparty_usdt_ata: Box<Account<'info, SplTokenAccount>>,
+    pub receiving_usdt_ata: Box<Account<'info, SplTokenAccount>>,
 
     #[account(mint::token_program = token_program)]
     pub usdc_mint: Box<Account<'info, SplMint>>,
@@ -92,7 +75,7 @@ pub struct Release<'info> {
         seeds = [
             b"deposit",
             escrow.key().as_ref(),
-            original_depositor.key().as_ref(),
+            sender.key().as_ref(),
             recent_blockhash.as_ref()
         ],
         bump,
@@ -105,43 +88,25 @@ pub struct Release<'info> {
     pub rent: Sysvar<'info, Rent>,
 }
 
-
 impl<'info> Release<'info> {
-
     pub fn release(&mut self, _recent_blockhash: [u8; 32]) -> Result<()> {
-        require!(
-            self.receiving_party.key() == self.original_depositor.key() ||
-            self.receiving_party.key() == self.counterparty.key(),
-            ErrorCode::InvalidParties
-        );
 
-        // 1. Verify the parties match the escrow's sender and receiver
-        let original_depositor_is_sender = self.original_depositor.key() == self.escrow.sender;
-        let original_depositor_is_receiver = self.original_depositor.key() == self.escrow.receiver;
-        let counterparty_is_sender = self.counterparty.key() == self.escrow.sender;
-        let counterparty_is_receiver = self.counterparty.key() == self.escrow.receiver;
-        
         require!(
-            (original_depositor_is_sender && counterparty_is_receiver) || 
-            (original_depositor_is_receiver && counterparty_is_sender),
-            ErrorCode::InvalidParties
+            self.deposit_record.state == DepositState::PendingWithdrawal,
+            ErrorCode::InvalidState
         );
 
         match self.deposit_record.policy {
             SignaturePolicy::Dual => {
-                // For dual signature policy:
-                // - Client must ensure both parties sign the transaction
-                // - In the program, we can only verify that the authorized_signer is one of the parties
-                // - The second signature is validated at the transaction level
                 require!(
-                    self.authorized_signer.key() == self.original_depositor.key() ||
-                    self.authorized_signer.key() == self.counterparty.key(),
+                    self.sender.is_signer && self.receiver.is_signer,
                     ErrorCode::InvalidSigner
                 );
             }
             SignaturePolicy::Single { signer } => {
                 require!(
-                    self.authorized_signer.key() == signer,
+                    (signer == self.sender.key() && self.sender.is_signer) ||
+                    (signer == self.receiver.key() && self.receiver.is_signer),
                     ErrorCode::InvalidSigner
                 );
             }
@@ -149,27 +114,17 @@ impl<'info> Release<'info> {
         
         let amount = self.deposit_record.amount;
         let stable = self.deposit_record.stable.clone();
-
-        let receiving_party_is_depositor = self.receiving_party.key() == self.original_depositor.key();
         
         let (vault, to_ata, mint, decimals) = match stable {
             Stable::Usdc => (
                 &self.vault_usdc,
-                if receiving_party_is_depositor {
-                    &self.depositor_usdc_ata
-                } else {
-                    &self.counterparty_usdc_ata
-                },
+                &self.receiving_usdc_ata,
                 &self.usdc_mint,
                 self.usdc_mint.decimals,
             ),
             Stable::Usdt => (
                 &self.vault_usdt,
-                if receiving_party_is_depositor {
-                    &self.depositor_usdt_ata
-                } else {
-                    &self.counterparty_usdt_ata
-                },
+                &self.receiving_usdt_ata,
                 &self.usdt_mint,
                 self.usdt_mint.decimals,
             ),
@@ -183,7 +138,6 @@ impl<'info> Release<'info> {
         };
 
         let bump = self.escrow.bump;
-
         let escrow_seeds: [&[u8]; 4] = [
             b"escrow".as_ref(),
             self.escrow.sender.as_ref(),
@@ -191,8 +145,8 @@ impl<'info> Release<'info> {
             &[bump],
         ];
         let seeds_slice: &[&[u8]] = &escrow_seeds;
-        
         let signer_seeds = &[seeds_slice];
+        
         let cpi_ctx = CpiContext::new_with_signer(
             self.token_program.to_account_info(),
             cpi_accounts,
