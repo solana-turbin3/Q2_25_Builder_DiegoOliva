@@ -7,7 +7,7 @@ use anchor_spl::{
 };
 
 use crate::error::ErrorCode;
-use crate::state::{Escrow, DepositRecord, DepositState, Stable, SignaturePolicy, USDC_MINT_ADDR, USDT_MINT_ADDR, EscrowState, AuthorizedBy};
+use crate::state::{Escrow, DepositRecord, DepositState, Stable, USDC_MINT_ADDR, USDT_MINT_ADDR, EscrowState, AuthorizedBy};
 
 #[derive(Accounts)]
 #[instruction(stable: Stable, authorization: AuthorizedBy, recent_blockhash: [u8; 32])]
@@ -16,42 +16,37 @@ pub struct Deposit<'info> {
     pub escrow: Box<Account<'info, Escrow>>,
 
     #[account(mut)]
-    pub depositor: Signer<'info>,
+    pub sender: Signer<'info>,
 
-    /// CHECK: we're just storing the pubkey
-    pub counterparty: AccountInfo<'info>,
-
-    #[account(
-        mut,
-        associated_token::mint = usdc_mint,
-        associated_token::authority = depositor,
-        associated_token::token_program = token_program
-    )]
-    pub depositor_usdc_ata: Box<Account<'info, SplTokenAccount>>,
-
-    #[account(
-        mut,
-        associated_token::mint = usdt_mint,
-        associated_token::authority = depositor,
-        associated_token::token_program = token_program
-    )]
-    pub depositor_usdt_ata: Box<Account<'info, SplTokenAccount>>,
+    /// CHECK: Receiver of the escrow
+    #[account(mut)]
+    pub receiver: AccountInfo<'info>,
 
     #[account(
         mut,
         associated_token::mint = usdc_mint,
-        associated_token::authority = counterparty,
-        associated_token::token_program = token_program
+        associated_token::authority = sender,
     )]
-    pub counterparty_usdc_ata: Box<Account<'info, SplTokenAccount>>,
+    pub sender_usdc_ata: Box<Account<'info, SplTokenAccount>>,
 
     #[account(
         mut,
         associated_token::mint = usdt_mint,
-        associated_token::authority = counterparty,
-        associated_token::token_program = token_program
+        associated_token::authority = sender,
     )]
-    pub counterparty_usdt_ata: Box<Account<'info, SplTokenAccount>>,
+    pub sender_usdt_ata: Box<Account<'info, SplTokenAccount>>,
+
+    #[account(
+        associated_token::mint = usdc_mint,
+        associated_token::authority = receiver,
+    )]
+    pub receiver_usdc_ata: Box<Account<'info, SplTokenAccount>>,
+
+    #[account(
+        associated_token::mint = usdt_mint,
+        associated_token::authority = receiver,
+    )]
+    pub receiver_usdt_ata: Box<Account<'info, SplTokenAccount>>,
 
     #[account(
         mint::token_program = token_program,
@@ -100,7 +95,7 @@ pub struct Deposit<'info> {
         seeds = [
             b"deposit",
             escrow.key().as_ref(),
-            depositor.key().as_ref(),
+            sender.key().as_ref(),
             recent_blockhash.as_ref()
         ],
         bump
@@ -113,41 +108,25 @@ pub struct Deposit<'info> {
     pub rent: Sysvar<'info, Rent>,
 }
 
-
 impl<'info> Deposit<'info> {
-
-    pub fn deposit(&mut self,
+    pub fn deposit(
+        &mut self,
         stable: Stable,
         authorization: AuthorizedBy,
         bump: &DepositBumps,
         amount: u64,
     ) -> Result<()> {
+        
         require!(
            self.escrow.state == EscrowState::Active,
            ErrorCode::InvalidState
         );
-        // @todo change specific mints to simply SPLs
 
         let escrow = &mut self.escrow;
-        
         let deposit_idx = escrow.deposit_count;
 
-        // Verify the depositor is either the sender or receiver
-        let is_sender = self.depositor.key() == escrow.sender;
-        let is_receiver = self.depositor.key() == escrow.receiver;
-        require!(is_sender || is_receiver, ErrorCode::InvalidDepositor);
-        
-        if is_sender {
-            require!(self.counterparty.key() == escrow.receiver, ErrorCode::InvalidCounterparty);
-        } else {
-            require!(self.counterparty.key() == escrow.sender, ErrorCode::InvalidCounterparty);
-        }
-
-        let policy = match authorization {
-            AuthorizedBy::Both => SignaturePolicy::Dual,
-            AuthorizedBy::Sender => SignaturePolicy::Single { signer: escrow.sender },
-            AuthorizedBy::Receiver => SignaturePolicy::Single { signer: escrow.receiver },
-        };
+        // Create the signature policy based on authorization
+        let policy = authorization.to_policy(escrow.sender, escrow.receiver);
 
         self.deposit_record.set_inner(DepositRecord {
             escrow: escrow.key(),
@@ -159,15 +138,15 @@ impl<'info> Deposit<'info> {
             state: DepositState::PendingWithdrawal,
         });
 
-        let (from_info, mint_info, to_info, decimals) = match stable {
+        let (from_account, mint_info, to_info, decimals) = match stable {
             Stable::Usdc => (
-                self.depositor_usdc_ata.to_account_info(),
+                self.sender_usdc_ata.to_account_info(),
                 self.usdc_mint.to_account_info(),
                 self.vault_usdc.to_account_info(),
                 self.usdc_mint.decimals,
             ),
             Stable::Usdt => (
-                self.depositor_usdt_ata.to_account_info(),
+                self.sender_usdt_ata.to_account_info(),
                 self.usdt_mint.to_account_info(),
                 self.vault_usdt.to_account_info(),
                 self.usdt_mint.decimals,
@@ -175,10 +154,10 @@ impl<'info> Deposit<'info> {
         };
 
         let cpi_accounts = TransferChecked {
-            from: from_info,
+            from: from_account,
             mint: mint_info,
             to: to_info,
-            authority: self.depositor.to_account_info(),
+            authority: self.sender.to_account_info(),
         };
         let cpi_ctx = CpiContext::new(self.token_program.to_account_info(), cpi_accounts);
         transfer_checked(cpi_ctx, amount, decimals)?;
