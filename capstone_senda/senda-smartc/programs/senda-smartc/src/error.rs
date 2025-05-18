@@ -6,6 +6,9 @@ pub enum ErrorCode {
     #[msg("Authorization error: Invalid signer for this policy")]  
     InvalidSigner,
     
+    #[msg("Authorization error: Authority cannot be the same as sender")]
+    InvalidAuthority,
+    
     // === Account Validation Errors ===
     #[msg("Account validation error: Invalid USDC mint address")]  
     InvalidUsdcMint,
