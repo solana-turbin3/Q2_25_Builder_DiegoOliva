@@ -26,6 +26,13 @@ pub struct Release<'info> {
     #[account(mut)]
     pub receiver: AccountInfo<'info>,
 
+    #[account(
+        mut,
+        signer,
+        constraint = authority.key() == escrow.authority @ ErrorCode::InvalidAuthority
+    )]
+    pub authority: Signer<'info>,
+
     /// CHECK: Account that will receive the funds
     #[account(mut)]
     pub receiving_party: AccountInfo<'info>,
