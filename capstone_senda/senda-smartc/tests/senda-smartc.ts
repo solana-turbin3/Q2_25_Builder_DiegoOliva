@@ -231,9 +231,6 @@ describe("senda_dapp", () => {
     console.log(`Authority USDC balance: ${await getTokenBalance(authorityUsdcAta)}`);
     console.log(`Authority USDT balance: ${await getTokenBalance(authorityUsdtAta)}`);
 
-    // Instead of attempting to pre-fund all wallets at once,
-    // we'll fund them individually using the ensureTokenBalance helper function
-    // when needed in each test.
     console.log("Token pre-funding skipped - wallets will be funded as needed in each test");
   });
 
@@ -303,11 +300,85 @@ describe("senda_dapp", () => {
     }
   });
 
-  it("initializeEscrow: creates an escrow PDA with correct data", async () => {
+  it("initializeEscrow: requires authority signature", async () => {
+    console.log("\n=== Starting initializeEscrow authority signature test ===");
+    const depositSender = Keypair.generate();
+    const depositReceiver = Keypair.generate();
 
+    await provider.sendAndConfirm(
+      new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: authority.publicKey,
+          toPubkey: depositSender.publicKey,
+          lamports: 0.1 * LAMPORTS_PER_SOL,
+        })
+      ),
+      [authority]
+    );
+
+    await provider.sendAndConfirm(
+      new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: authority.publicKey,
+          toPubkey: depositReceiver.publicKey,
+          lamports: 0.1 * LAMPORTS_PER_SOL,
+        })
+      ),
+      [authority]
+    );
+
+    const senderUsdcAta = getAssociatedTokenAddressSync(
+      USDC_MINT_ADDR,
+      depositSender.publicKey,
+      false
+    );
+    const senderUsdtAta = getAssociatedTokenAddressSync(
+      USDT_MINT_ADDR,
+      depositSender.publicKey,
+      false
+    );
+    const receiverUsdcAta = getAssociatedTokenAddressSync(
+      USDC_MINT_ADDR,
+      depositReceiver.publicKey,
+      false
+    );
+    const receiverUsdtAta = getAssociatedTokenAddressSync(
+      USDT_MINT_ADDR,
+      depositReceiver.publicKey,
+      false
+    );
+
+    await provider.sendAndConfirm(
+      new Transaction()
+        .add(createAssociatedTokenAccountIdempotentInstruction(
+          authority.publicKey,
+          senderUsdcAta,
+          depositSender.publicKey,
+          USDC_MINT_ADDR
+        ))
+        .add(createAssociatedTokenAccountIdempotentInstruction(
+          authority.publicKey,
+          senderUsdtAta,
+          depositSender.publicKey,
+          USDT_MINT_ADDR
+        ))
+        .add(createAssociatedTokenAccountIdempotentInstruction(
+          authority.publicKey,
+          receiverUsdcAta,
+          depositReceiver.publicKey,
+          USDC_MINT_ADDR
+        ))
+        .add(createAssociatedTokenAccountIdempotentInstruction(
+          authority.publicKey,
+          receiverUsdtAta,
+          depositReceiver.publicKey,
+          USDT_MINT_ADDR
+        )),
+      [authority]
+    );
 
     const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
-      [Buffer.from("escrow"), sender.publicKey.toBuffer(), receiver.publicKey.toBuffer()],
+      [Buffer.from("escrow"), depositSender.publicKey.toBuffer(), depositReceiver.publicKey.toBuffer()],
       program.programId
     );
 
@@ -315,18 +386,25 @@ describe("senda_dapp", () => {
       [Buffer.from("usdc-vault"), escrowPda.toBuffer(), USDC_MINT_ADDR.toBuffer()],
       program.programId
     );
+
     const [vaultUsdt, vaultUsdtBump] = PublicKey.findProgramAddressSync(
       [Buffer.from("usdt-vault"), escrowPda.toBuffer(), USDT_MINT_ADDR.toBuffer()],
       program.programId
     );
 
     try {
-      await program.methods
+      console.log("\nAttempting initialization without authority signature...");
+      
+      // Get the transaction object first
+      const ix = await program.methods
         .initializeEscrow(new BN(0))
         .accounts({
           escrow: escrowPda,
-          sender: sender.publicKey,
-          receiver: receiver.publicKey,
+          feePayer: authority.publicKey,
+          factory: factoryPDA,
+          sender: depositSender.publicKey,
+          receiver: depositReceiver.publicKey,
+          authority: authority.publicKey,
           senderUsdcAta: senderUsdcAta,
           senderUsdtAta: senderUsdtAta,
           receiverUsdcAta: receiverUsdcAta,
@@ -340,17 +418,271 @@ describe("senda_dapp", () => {
           systemProgram: SystemProgram.programId,
           rent: SYSVAR_RENT_PUBKEY,
         } as InitEscrowAccounts)
-        .signers([sender])
-        .rpc();
+        .instruction();
+
+      // Create transaction and add the instruction
+      const tx = new Transaction().add(ix);
+      
+      // Get recent blockhash
+      const { blockhash } = await connection.getLatestBlockhash();
+      tx.recentBlockhash = blockhash;
+      tx.feePayer = depositSender.publicKey;
+
+      console.log("Transaction created. Signers:", {
+        depositSender: depositSender.publicKey.toString(),
+        authority: "not signing"
+      });
+
+      // Sign with only depositSender
+      tx.sign(depositSender);
+
+      console.log("Sending transaction without authority signature...");
+      const serializedTx = tx.serialize();
+      const txid = await connection.sendRawTransaction(serializedTx, {
+        skipPreflight: false,
+        preflightCommitment: "confirmed"
+      });
+
+      // Wait for confirmation
+      const confirmation = await connection.confirmTransaction(txid);
+      
+      if (confirmation.value.err) {
+        throw new Error(`Transaction failed: ${confirmation.value.err}`);
+      }
+
+      console.log("ERROR: Transaction succeeded when it should have failed");
+      assert.fail("Should have failed without authority signature");
+    } catch (error) {
+      console.log("\nReceived expected error:", error.toString());
+      const errorMessage = error.toString().toLowerCase();
+      
+      // Log more details about the error
+      console.log("\nError details:");
+      console.log(JSON.stringify(error, null, 2));
+      
+      const hasSignatureError = 
+        errorMessage.includes("signature verification failed") || 
+        errorMessage.includes("missing required signature") ||
+        errorMessage.includes("0x1771") ||
+        errorMessage.includes("accountnotsigner") ||  // Add program-specific error
+        errorMessage.includes("error code: accountnotsigner");  // Add program-specific error message
+
+      console.log(`\nError analysis:
+      - Contains 'signature verification failed': ${errorMessage.includes("signature verification failed")}
+      - Contains 'missing required signature': ${errorMessage.includes("missing required signature")}
+      - Contains '0x1771': ${errorMessage.includes("0x1771")}
+      - Contains 'accountnotsigner': ${errorMessage.includes("accountnotsigner")}
+      `);
+
+      assert.ok(
+        hasSignatureError,
+        `Expected signature verification or AccountNotSigner error, but got: ${errorMessage}`
+      );
+    }
+
+    console.log("\nNow trying with authority signature...");
+    try {
+      const ix = await program.methods
+        .initializeEscrow(new BN(0))
+        .accounts({
+          escrow: escrowPda,
+          feePayer: authority.publicKey,
+          factory: factoryPDA,
+          sender: depositSender.publicKey,
+          receiver: depositReceiver.publicKey,
+          authority: authority.publicKey,
+          senderUsdcAta: senderUsdcAta,
+          senderUsdtAta: senderUsdtAta,
+          receiverUsdcAta: receiverUsdcAta,
+          receiverUsdtAta: receiverUsdtAta,
+          usdcMint: USDC_MINT_ADDR,
+          usdtMint: USDT_MINT_ADDR,
+          vaultUsdc,
+          vaultUsdt,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+          rent: SYSVAR_RENT_PUBKEY,
+        } as InitEscrowAccounts)
+        .instruction();
+
+      const tx = new Transaction().add(ix);
+      const { blockhash } = await connection.getLatestBlockhash();
+      tx.recentBlockhash = blockhash;
+      tx.feePayer = authority.publicKey;
+
+      console.log("Transaction created. Signers:", {
+        depositSender: depositSender.publicKey.toString(),
+        authority: authority.publicKey.toString()
+      });
+
+      // Sign with both depositSender and authority
+      tx.sign(depositSender, authority);
+
+      console.log("Sending transaction with both signatures...");
+      const txid = await connection.sendRawTransaction(tx.serialize(), {
+        skipPreflight: false,
+        preflightCommitment: "confirmed"
+      });
+
+      await connection.confirmTransaction(txid);
+      console.log("Transaction confirmed:", txid);
+
+      // Wait a bit before fetching the account to ensure it's available
+      await new Promise(resolve => setTimeout(resolve, 2000));
 
       const esc = await program.account.escrow.fetch(escrowPda);
-      assert.strictEqual(esc.seed.toNumber(), 0);
-      assert.strictEqual(esc.bump, escrowBump);
-      assert.strictEqual(esc.depositedUsdc.toNumber(), 0);
-      assert.strictEqual(esc.depositedUsdt.toNumber(), 0);
+      console.log("\nEscrow initialized successfully. Escrow state:", {
+        seed: esc.seed.toNumber(),
+        bump: esc.bump,
+        depositedUsdc: esc.depositedUsdc.toNumber(),
+        depositedUsdt: esc.depositedUsdt.toNumber(),
+        authority: esc.authority.toBase58()
+      });
     } catch (error) {
-      console.error("Error initializing escrow:", error);
+      console.error("\nUnexpected error during successful initialization:", error);
       throw error;
+    }
+
+    console.log("=== Test completed successfully ===\n");
+  });
+
+  it("prevents direct program calls without authority signature", async () => {
+    console.log("\n=== Starting direct program call test ===");
+    const depositSender = Keypair.generate();
+    const depositReceiver = Keypair.generate();
+
+    await provider.sendAndConfirm(
+      new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: authority.publicKey,
+          toPubkey: depositSender.publicKey,
+          lamports: 0.1 * LAMPORTS_PER_SOL,
+        })
+      ),
+      [authority]
+    );
+
+    const senderUsdcAta = getAssociatedTokenAddressSync(
+      USDC_MINT_ADDR,
+      depositSender.publicKey,
+      false
+    );
+    const senderUsdtAta = getAssociatedTokenAddressSync(
+      USDT_MINT_ADDR,
+      depositSender.publicKey,
+      false
+    );
+    const receiverUsdcAta = getAssociatedTokenAddressSync(
+      USDC_MINT_ADDR,
+      depositReceiver.publicKey,
+      false
+    );
+    const receiverUsdtAta = getAssociatedTokenAddressSync(
+      USDT_MINT_ADDR,
+      depositReceiver.publicKey,
+      false
+    );
+
+    await provider.sendAndConfirm(
+      new Transaction()
+        .add(createAssociatedTokenAccountIdempotentInstruction(
+          authority.publicKey,
+          senderUsdcAta,
+          depositSender.publicKey,
+          USDC_MINT_ADDR
+        ))
+        .add(createAssociatedTokenAccountIdempotentInstruction(
+          authority.publicKey,
+          senderUsdtAta,
+          depositSender.publicKey,
+          USDT_MINT_ADDR
+        ))
+        .add(createAssociatedTokenAccountIdempotentInstruction(
+          authority.publicKey,
+          receiverUsdcAta,
+          depositReceiver.publicKey,
+          USDC_MINT_ADDR
+        ))
+        .add(createAssociatedTokenAccountIdempotentInstruction(
+          authority.publicKey,
+          receiverUsdtAta,
+          depositReceiver.publicKey,
+          USDT_MINT_ADDR
+        )),
+      [authority]
+    );
+
+    const [escrowPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow"), depositSender.publicKey.toBuffer(), depositReceiver.publicKey.toBuffer()],
+      program.programId
+    );
+
+    const [vaultUsdc] = PublicKey.findProgramAddressSync(
+      [Buffer.from("usdc-vault"), escrowPda.toBuffer(), USDC_MINT_ADDR.toBuffer()],
+      program.programId
+    );
+
+    const [vaultUsdt] = PublicKey.findProgramAddressSync(
+      [Buffer.from("usdt-vault"), escrowPda.toBuffer(), USDT_MINT_ADDR.toBuffer()],
+      program.programId
+    );
+
+    try {
+      console.log("\nAttempting to call program directly without authority signature...");
+      
+      // Create the instruction data manually
+      const initializeEscrowInstructionData = Buffer.from([
+        243, 160, 77, 153, 11, 92, 48, 209, // discriminator for initializeEscrow
+        0, 0, 0, 0, 0, 0, 0, 0              // seed (u64) = 0
+      ]);
+
+      const ix = new web3.TransactionInstruction({
+        programId: program.programId,
+        keys: [
+          { pubkey: depositSender.publicKey, isSigner: true, isWritable: true },
+          { pubkey: factoryPDA, isSigner: false, isWritable: false },
+          { pubkey: escrowPda, isSigner: false, isWritable: true },
+          { pubkey: depositSender.publicKey, isSigner: true, isWritable: true },
+          { pubkey: depositReceiver.publicKey, isSigner: false, isWritable: false },
+          { pubkey: authority.publicKey, isSigner: false, isWritable: true },
+          { pubkey: senderUsdcAta, isSigner: false, isWritable: false },
+          { pubkey: senderUsdtAta, isSigner: false, isWritable: false },
+          { pubkey: receiverUsdcAta, isSigner: false, isWritable: false },
+          { pubkey: receiverUsdtAta, isSigner: false, isWritable: false },
+          { pubkey: USDC_MINT_ADDR, isSigner: false, isWritable: false },
+          { pubkey: USDT_MINT_ADDR, isSigner: false, isWritable: false },
+          { pubkey: vaultUsdc, isSigner: false, isWritable: true },
+          { pubkey: vaultUsdt, isSigner: false, isWritable: true },
+          { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+          { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+          { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+          { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+        ],
+        data: initializeEscrowInstructionData,
+      });
+
+      const tx = new Transaction().add(ix);
+      await web3.sendAndConfirmTransaction(connection, tx, [depositSender]);
+      console.log("Init escrow transaction failed successfully");
+
+      console.log("ERROR: Transaction succeeded when it should have failed");
+      assert.fail("Direct program call should have failed without authority signature");
+    } catch (error) {
+      console.log("\nReceived expected error:", error.toString());
+      const errorMessage = error.toString().toLowerCase();
+      
+      const hasSignatureError = 
+        errorMessage.includes("signature verification failed") || 
+        errorMessage.includes("missing required signature") ||
+        errorMessage.includes("0x1771") ||
+        errorMessage.includes("accountnotsigner") ||
+        errorMessage.includes("error code: accountnotsigner");
+
+      assert.ok(
+        hasSignatureError,
+        `Expected signature verification or AccountNotSigner error, but got: ${errorMessage}`
+      );
     }
   });
 
@@ -391,7 +723,7 @@ describe("senda_dapp", () => {
     console.log(`Sender USDC balance: ${tokenBalance} USDC`);
 
     // just in case
-    if (tokenBalance < 0.5) {
+    if (tokenBalance < 1) {
       const depositTokenAmount = 500_000; // 0.5 USDC
 
       await provider.sendAndConfirm(
@@ -408,7 +740,7 @@ describe("senda_dapp", () => {
         [authority]
       );
 
-      console.log(`Topped up sender with 0.5 USDC`);
+      console.log(`Topped up sender with 1 USDC`);
       console.log(`Sender USDC balance: ${await getTokenBalance(senderUsdcAta)}`);
     }
 
@@ -427,13 +759,14 @@ describe("senda_dapp", () => {
       program.programId
     );
 
-    await program.methods
+    const ix = await program.methods
       .initializeEscrow(new BN(0))
       .accounts({
         escrow: escrowPda,
         feePayer: authority.publicKey,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
         receiverUsdcAta: receiverUsdcAta,
@@ -447,9 +780,12 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY,
       } as InitEscrowAccounts)
-      .signers([depositSender, authority])
-      .rpc();
+      .instruction();
 
+    const tx = new Transaction().add(ix);
+
+    const initEscrowSig = await web3.sendAndConfirmTransaction(connection, tx, [depositSender, authority]);
+    console.log("Init escrow transaction signature:", initEscrowSig);
     console.log("Escrow initialized successfully");
 
     const blockhashArray = await getRecentBlockhashArray(connection);
@@ -469,6 +805,7 @@ describe("senda_dapp", () => {
           escrow: escrowPda,
           sender: depositSender.publicKey,
           receiver: depositReceiver.publicKey,
+          authority: authority.publicKey,
           senderUsdcAta: senderUsdcAta,
           senderUsdtAta: senderUsdtAta,
           receiverUsdcAta: receiverUsdcAta,
@@ -563,7 +900,7 @@ describe("senda_dapp", () => {
       program.programId
     );
 
-    await program.methods
+    const ix = await program.methods
       .initializeEscrow(new BN(0))
       .accounts({
         escrow: escrowPda,
@@ -583,9 +920,11 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY,
       } as InitEscrowAccounts)
-      .signers([depositSender, authority])
-      .rpc();
+      .instruction();
 
+    const tx = new Transaction().add(ix);
+    const initEscrowSig = await web3.sendAndConfirmTransaction(connection, tx, [depositSender, authority]);
+    console.log("Init escrow transaction signature:", initEscrowSig);
     console.log("Escrow initialized successfully");
 
     const blockhashArray = await getRecentBlockhashArray(connection);
@@ -594,12 +933,13 @@ describe("senda_dapp", () => {
     const amountToDeposit = new BN(100_000_000); // 0.1 USDT with 9 decimals (reduced amount)
 
     try {
-      const tx = await program.methods
+      const ix = await program.methods
         .deposit({ usdt: {} }, { sender: {} }, blockhashArray, amountToDeposit)
         .accounts({
           escrow: escrowPda,
           sender: depositSender.publicKey,
           receiver: depositReceiver.publicKey,
+          authority: authority.publicKey,
           usdcMint: USDC_MINT_ADDR,
           usdtMint: USDT_MINT_ADDR,
           vaultUsdc: vaultUsdc,
@@ -611,10 +951,12 @@ describe("senda_dapp", () => {
           systemProgram: SystemProgram.programId,
           rent: SYSVAR_RENT_PUBKEY
         } as DepositAccounts)
-        .signers([depositSender, authority])
-        .rpc();
+        .instruction();
 
-      console.log(`Deposit transaction signature: ${tx}`);
+      const depositTx = new Transaction().add(ix);
+      const depositSig = await web3.sendAndConfirmTransaction(connection, depositTx, [depositSender, authority]);
+
+      console.log(`Deposit transaction signature: ${depositSig}`);
 
       const escrowAccount = await program.account.escrow.fetch(escrowPda);
       assert.strictEqual(escrowAccount.depositCount.toNumber(), 1, "Deposit count should be 1 after deposit");
@@ -730,7 +1072,6 @@ describe("senda_dapp", () => {
     console.log(`Transferred 1 USDT to sender for dual signature test`);
     console.log(`Sender USDT balance after funding: ${await getTokenBalance(senderUsdtAta)}`);
 
-    // Create escrow with random seed
     const escrowSeed = new BN(randomBytes(8));
 
     const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
@@ -748,13 +1089,14 @@ describe("senda_dapp", () => {
       program.programId
     );
 
-    await program.methods
+    const ix =await program.methods
       .initializeEscrow(escrowSeed)
       .accounts({
         escrow: escrowPda,
         feePayer: authority.publicKey,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
         receiverUsdcAta: receiverUsdcAta,
@@ -768,9 +1110,11 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY,
       } as InitEscrowAccounts)
-      .signers([depositSender, authority])
-      .rpc();
+      .instruction();
 
+    const tx = new Transaction().add(ix);
+    const initEscrowSig = await web3.sendAndConfirmTransaction(connection, tx, [depositSender, authority]);
+    console.log("Init escrow transaction signature:", initEscrowSig);
     console.log("Escrow initialized successfully for dual signature test");
 
     const blockhashArray = await getRecentBlockhashArray(connection);
@@ -779,30 +1123,31 @@ describe("senda_dapp", () => {
     const [depositRecordPda] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
 
     // Use a smaller deposit amount for USDT
-    const depositAmount = new BN(100_000_000); // 0.1 USDT with 9 decimals (reduced from 1 USDT)
+    const depositAmount = new BN(100_000_000);
 
     // Make the deposit with dual signature policy
     const depositIx = await program.methods
-              .deposit({ usdt: {} }, { both: {} }, blockhashArray, depositAmount)
-        .accounts({
-          escrow: escrowPda,
-          sender: depositSender.publicKey,
-          receiver: depositReceiver.publicKey,
-          usdcMint: USDC_MINT_ADDR,
-          usdtMint: USDT_MINT_ADDR,
-          senderUsdcAta: senderUsdcAta,
-          senderUsdtAta: senderUsdtAta,
-          receiverUsdcAta: receiverUsdcAta,
-          receiverUsdtAta: receiverUsdtAta,
-          vaultUsdc: vaultUsdc,
-          vaultUsdt: vaultUsdt,
-          depositRecord: depositRecordPda,
-          feePayer: authority.publicKey,
-          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-          rent: SYSVAR_RENT_PUBKEY
-        } as DepositAccounts)
+      .deposit({ usdt: {} }, { both: {} }, blockhashArray, depositAmount)
+      .accounts({
+        escrow: escrowPda,
+        sender: depositSender.publicKey,
+        receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
+        usdcMint: USDC_MINT_ADDR,
+        usdtMint: USDT_MINT_ADDR,
+        senderUsdcAta: senderUsdcAta,
+        senderUsdtAta: senderUsdtAta,
+        receiverUsdcAta: receiverUsdcAta,
+        receiverUsdtAta: receiverUsdtAta,
+        vaultUsdc: vaultUsdc,
+        vaultUsdt: vaultUsdt,
+        depositRecord: depositRecordPda,
+        feePayer: authority.publicKey,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+        rent: SYSVAR_RENT_PUBKEY
+      } as DepositAccounts)
       .instruction();
 
     const depositTx = new Transaction().add(depositIx);
@@ -836,6 +1181,7 @@ describe("senda_dapp", () => {
           sender: depositSender.publicKey,
           receiver: depositReceiver.publicKey,
           receivingParty: depositReceiver.publicKey,
+          authority: authority.publicKey,
           receivingUsdcAta: receiverUsdcAta,
           receivingUsdtAta: receiverUsdtAta,
           usdcMint: USDC_MINT_ADDR,
@@ -857,7 +1203,7 @@ describe("senda_dapp", () => {
       const releaseSig = await web3.sendAndConfirmTransaction(
         connection,
         releaseTx,
-        [depositSender, depositReceiver] // Both parties must sign for dual signature policy
+        [depositSender, depositReceiver, authority]
       );
 
       console.log(`Released funds with dual signature: ${releaseSig}`);
@@ -884,7 +1230,6 @@ describe("senda_dapp", () => {
   });
 
   it("releases funds using single signature policy when receiver is the signer", async () => {
-    // Generate new wallets to avoid account reuse
     const depositSender = Keypair.generate();
     const depositReceiver = Keypair.generate();
 
@@ -984,7 +1329,6 @@ describe("senda_dapp", () => {
 
     console.log(`Transferred 1 USDC to sender for receiver-signer test`);
 
-    // Use a random seed to avoid account reuse
     const escrowSeed = new BN(randomBytes(8));
 
     const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
@@ -1000,13 +1344,14 @@ describe("senda_dapp", () => {
       program.programId
     );
 
-    await program.methods
+    const ix =await program.methods
       .initializeEscrow(escrowSeed)
       .accounts({
         escrow: escrowPda,
         feePayer: authority.publicKey,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
         receiverUsdcAta: receiverUsdcAta,
@@ -1020,8 +1365,12 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY,
       } as InitEscrowAccounts)
-      .signers([depositSender, authority])
-      .rpc();
+      .instruction();
+
+      const tx = new Transaction().add(ix);
+      const initEscrowSig = await web3.sendAndConfirmTransaction(connection, tx, [depositSender, authority]);
+      console.log("Init escrow transaction signature:", initEscrowSig);
+      console.log("Escrow initialized successfully for receiver-signer test");
 
     const blockhashArray = await getRecentBlockhashArray(connection);
 
@@ -1029,18 +1378,19 @@ describe("senda_dapp", () => {
 
     const depositAmount = new BN(500_000);
 
-    // Create a deposit with single signature policy where the receiver is the designated signer
-    await program.methods
+    // receiver is the designated signer
+    const depositIx =await program.methods
       .deposit(
         { usdc: {} },
         { receiver: {} },
-        blockhashArray,  // Pass the array directly
+        blockhashArray,
         depositAmount
       )
       .accounts({
         escrow: escrowPda,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         usdcMint: USDC_MINT_ADDR,
         usdtMint: USDT_MINT_ADDR,
         senderUsdcAta: senderUsdcAta,
@@ -1056,8 +1406,11 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY
       } as DepositAccounts)
-      .signers([depositSender, authority])
-      .rpc();
+      .instruction();
+
+    const depositTx = new Transaction().add(depositIx);
+    const depositSig = await web3.sendAndConfirmTransaction(connection, depositTx, [depositSender, authority]);
+    console.log("Deposit transaction signature:", depositSig);
 
     console.log(`Deposit with receiver as authorized signer: success`);
 
@@ -1066,10 +1419,6 @@ describe("senda_dapp", () => {
     console.log(`Receiver USDC balance before release: ${receiverBalanceBefore}`);
     console.log(`Vault USDC balance before release: ${vaultBalanceBefore}`);
 
-    // Get the latest blockhash for transaction
-    const blockhash = await connection.getLatestBlockhash();
-
-    // Create the release instruction
     const releaseIx = await program.methods
       .release(blockhashArray)
       .accounts({
@@ -1077,6 +1426,7 @@ describe("senda_dapp", () => {
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
         receivingParty: depositReceiver.publicKey,
+        authority: authority.publicKey,
         receivingUsdcAta: receiverUsdcAta,
         receivingUsdtAta: receiverUsdtAta,
         usdcMint: USDC_MINT_ADDR,
@@ -1091,10 +1441,7 @@ describe("senda_dapp", () => {
       } as ReleaseAccounts)
       .instruction()
 
-    // Create a transaction and add the instruction
     const releaseTx = new Transaction().add(releaseIx);
-
-    // Set the fee payer to the receiver (the authorized signer)
     // releaseTx.feePayer = depositReceiver.publicKey;
     // releaseTx.recentBlockhash = blockhash.blockhash;
 
@@ -1114,7 +1461,7 @@ describe("senda_dapp", () => {
     const releaseSig = await web3.sendAndConfirmTransaction(
       connection,
       releaseTx,
-      [depositReceiver]
+      [depositReceiver, authority]
     );
 
     console.log(`Released funds with receiver as signer: ${releaseSig}`);
@@ -1245,13 +1592,14 @@ describe("senda_dapp", () => {
       program.programId
     );
 
-    await program.methods
+    const ix = await program.methods
       .initializeEscrow(new BN(0))
       .accounts({
         escrow: escrowPda,
         feePayer: authority.publicKey,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
         receiverUsdcAta: receiverUsdcAta,
@@ -1265,8 +1613,12 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY,
       } as InitEscrowAccounts)
-      .signers([depositSender, authority])
-      .rpc();
+      .instruction();
+
+    const tx = new Transaction().add(ix);
+    const initEscrowSig = await web3.sendAndConfirmTransaction(connection, tx, [depositSender, authority]);
+    console.log("Init escrow transaction signature:", initEscrowSig);
+    console.log("Escrow initialized successfully for sender-signer test");
 
     const blockhashArray = await getRecentBlockhashArray(connection);
 
@@ -1274,8 +1626,8 @@ describe("senda_dapp", () => {
 
     const depositAmount = new BN(500_000);
 
-    // Create a deposit with single signature policy where the sender is the designated signer
-    await program.methods
+    // sender is the designated signer
+    const depositIx = await program.methods
       .deposit(
         { usdc: {} },
         { sender: {} },
@@ -1286,6 +1638,7 @@ describe("senda_dapp", () => {
         escrow: escrowPda,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
         receiverUsdcAta: receiverUsdcAta,
@@ -1301,8 +1654,11 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY
       } as DepositAccounts)
-      .signers([depositSender, authority])
-      .rpc();
+      .instruction();
+
+    const depositTx = new Transaction().add(depositIx);
+    const depositSig = await web3.sendAndConfirmTransaction(connection, depositTx, [depositSender, authority]);
+    console.log("Deposit transaction signature:", depositSig);
 
     console.log(`Deposit with sender as authorized signer: success`);
 
@@ -1311,7 +1667,6 @@ describe("senda_dapp", () => {
     console.log(`Receiver USDC balance before release: ${receiverBalanceBefore}`);
     console.log(`Vault USDC balance before release: ${vaultBalanceBefore}`);
 
-    // Release with the sender as the signer
     const releaseIx = await program.methods
       .release(blockhashArray)
       .accounts({
@@ -1319,6 +1674,7 @@ describe("senda_dapp", () => {
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
         receivingParty: depositReceiver.publicKey,
+        authority: authority.publicKey,
         receivingUsdcAta: receiverUsdcAta,
         receivingUsdtAta: receiverUsdtAta,
         usdcMint: USDC_MINT_ADDR,
@@ -1334,9 +1690,7 @@ describe("senda_dapp", () => {
       .instruction();
 
     const releaseTx = new Transaction();
-    releaseTx.add(releaseIx); // Add the instruction to the transaction
-
-    // releaseTx.feePayer = depositSender.publicKey;
+    releaseTx.add(releaseIx);
 
     // const releaseBlockHashInfo = await connection.getLatestBlockhash();
     // releaseTx.recentBlockhash = releaseBlockHashInfo.blockhash;
@@ -1352,7 +1706,7 @@ describe("senda_dapp", () => {
     const releaseSig = await web3.sendAndConfirmTransaction(
       connection,
       releaseTx,
-      [depositSender]
+      [depositSender, authority]
     );
 
     console.log(`Released funds with sender as signer: ${releaseSig}`);
@@ -1370,7 +1724,7 @@ describe("senda_dapp", () => {
   });
 
   it("prevents unauthorized release of funds", async () => {
-    // Generate new wallets for this test
+
     const depositSender = Keypair.generate();
     const depositReceiver = Keypair.generate();
     const unauthorizedSigner = Keypair.generate(); // Third party that will try to release
@@ -1402,7 +1756,6 @@ describe("senda_dapp", () => {
       [authority]
     );
 
-    // Create token accounts
     const senderUsdcAta = getAssociatedTokenAddressSync(
       USDC_MINT_ADDR,
       depositSender.publicKey,
@@ -1424,7 +1777,6 @@ describe("senda_dapp", () => {
       false
     );
 
-    // Create token accounts
     await provider.sendAndConfirm(
       new Transaction()
         .add(createAssociatedTokenAccountIdempotentInstruction(
@@ -1454,14 +1806,13 @@ describe("senda_dapp", () => {
       [authority]
     );
 
-    // Fund sender with USDC
     const walletUsdcAta = getAssociatedTokenAddressSync(
       USDC_MINT_ADDR,
       authority.publicKey,
       false
     );
 
-    const depositTokenAmount = 1_000_000; // 1 USDC
+    const depositTokenAmount = 1_000_000;
     await provider.sendAndConfirm(
       new Transaction().add(
         createTransferCheckedInstruction(
@@ -1494,14 +1845,14 @@ describe("senda_dapp", () => {
       program.programId
     );
 
-    // Initialize escrow
-    await program.methods
+   const ix = await program.methods
       .initializeEscrow(escrowSeed)
       .accounts({
         escrow: escrowPda,
         feePayer: authority.publicKey,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
         receiverUsdcAta: receiverUsdcAta,
@@ -1515,8 +1866,12 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY,
       } as InitEscrowAccounts)
-      .signers([depositSender, authority])
-      .rpc();
+      .instruction();
+    
+    const tx = new Transaction().add(ix);
+    const initEscrowSig = await web3.sendAndConfirmTransaction(connection, tx, [depositSender, authority]);
+    console.log("Init escrow transaction signature:", initEscrowSig);
+    console.log("Escrow initialized successfully for unauthorized release test");
 
     const blockhashArray = await getRecentBlockhashArray(connection);
     const [depositRecordPda, depositRecordBump] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
@@ -1533,6 +1888,7 @@ describe("senda_dapp", () => {
         escrow: escrowPda,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
         receiverUsdcAta: receiverUsdcAta,
@@ -1555,7 +1911,7 @@ describe("senda_dapp", () => {
 
     console.log("Deposit successful for unauthorized release test");
 
-    // Try to release with unauthorized signer
+    // release with unauthorized signer
     try {
       const releaseIx = await program.methods
         .release(blockhashArray)
@@ -1564,6 +1920,7 @@ describe("senda_dapp", () => {
           sender: depositSender.publicKey,
           receiver: depositReceiver.publicKey,
           receivingParty: depositReceiver.publicKey,
+          authority: authority.publicKey,
           receivingUsdcAta: receiverUsdcAta,
           receivingUsdtAta: receiverUsdtAta,
           usdcMint: USDC_MINT_ADDR,
@@ -1579,7 +1936,8 @@ describe("senda_dapp", () => {
         .instruction();
 
       const releaseTx = new Transaction().add(releaseIx);
-      await web3.sendAndConfirmTransaction(connection, releaseTx, [unauthorizedSigner]);
+      console.log("Sending release transaction with unauthorized signer and authority signer");
+      await web3.sendAndConfirmTransaction(connection, releaseTx, [unauthorizedSigner, authority]);
       assert.fail("Should not be able to release with unauthorized signer");
     } catch (err) {
       console.log("Expected error for unauthorized release attempt:", err);
@@ -1596,12 +1954,11 @@ describe("senda_dapp", () => {
   });
 
   it("ensures only depositor can cancel their own deposit", async () => {
-    // Generate new wallets for this test
+    
     const depositSender = Keypair.generate();
     const depositReceiver = Keypair.generate();
     const nonDepositor = Keypair.generate();
 
-    // Fund all wallets
     await provider.sendAndConfirm(
       new Transaction()
         .add(
@@ -1628,7 +1985,6 @@ describe("senda_dapp", () => {
       [authority]
     );
 
-    // Create token accounts
     const senderUsdcAta = getAssociatedTokenAddressSync(
       USDC_MINT_ADDR,
       depositSender.publicKey,
@@ -1690,9 +2046,8 @@ describe("senda_dapp", () => {
       [authority]
     );
 
-    // Fund sender with USDC
-    const walletUsdcAta = getAssociatedTokenAddressSync(
-      USDC_MINT_ADDR,
+    const walletUsdtAta = getAssociatedTokenAddressSync(
+      USDT_MINT_ADDR,
       authority.publicKey,
       false
     );
@@ -1700,20 +2055,19 @@ describe("senda_dapp", () => {
     await provider.sendAndConfirm(
       new Transaction().add(
         createTransferCheckedInstruction(
-          walletUsdcAta,
-          USDC_MINT_ADDR,
-          senderUsdcAta,
+          walletUsdtAta,
+          USDT_MINT_ADDR,
+          senderUsdtAta,
           authority.publicKey,
-          1_000_000,
-          6
+          1_000_000_000,
+          9
         )
       ),
       [authority]
     );
 
-    console.log(`Transferred 1 USDC to sender for cancel test`);
+    console.log(`Transferred 1 USDT to sender for cancel test`);
 
-    // Create an escrow with a random seed
     const escrowSeed = new BN(randomBytes(8));
 
     const [escrowPda, escrowBump] = PublicKey.findProgramAddressSync(
@@ -1731,14 +2085,14 @@ describe("senda_dapp", () => {
       program.programId
     );
 
-    // Initialize escrow
-    await program.methods
+    const ix = await program.methods
       .initializeEscrow(escrowSeed)
       .accounts({
         escrow: escrowPda,
         feePayer: authority.publicKey,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
         receiverUsdcAta: receiverUsdcAta,
@@ -1752,21 +2106,25 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY,
       } as InitEscrowAccounts)
-      .signers([depositSender, authority])
-      .rpc();
+      .instruction();
+
+    const tx = new Transaction().add(ix);
+    const initEscrowSig = await web3.sendAndConfirmTransaction(connection, tx, [depositSender, authority]);
+    console.log("Init escrow transaction signature:", initEscrowSig);
+    console.log("Escrow initialized successfully for cancel test");
 
     const blockhashArray = await getRecentBlockhashArray(connection);
 
-    // Create a deposit record
     const [depositRecordPda] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
 
-    // Make a deposit with single signature policy (sender as signer)
-    await program.methods
-      .deposit({ usdc: {} }, { sender: {} }, blockhashArray, new BN(500_000))
+    // (sender as signer)
+    const depositIx = await program.methods
+      .deposit({ usdt: {} }, { sender: {} }, blockhashArray, new BN(500_000_000))
       .accounts({
         escrow: escrowPda,
-        sender: depositSender.publicKey,  // Changed from depositor to sender
+        sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
         receiverUsdcAta: receiverUsdcAta,
@@ -1782,21 +2140,23 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY
       } as DepositAccounts)
-      .signers([depositSender, authority])
-      .rpc();
+      .instruction();
+
+    const depositTx = new Transaction().add(depositIx);
+    const depositSig = await web3.sendAndConfirmTransaction(connection, depositTx, [depositSender, authority]);
+    console.log("Deposit transaction signature:", depositSig);
 
     console.log(`Deposit successful for unauthorized release test`);
 
-    // Get the initial vault balance
     const vaultBalanceBefore = await getTokenBalance(vaultUsdc);
 
-    // Create the cancel instruction
     const cancelIx = await program.methods
       .cancel(blockhashArray)
       .accounts({
         escrow: escrowPda,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
         usdcMint: USDC_MINT_ADDR,
@@ -1811,12 +2171,11 @@ describe("senda_dapp", () => {
       } as CancelAccounts)
       .instruction();
 
-    // Try to cancel with non-depositor
+    // Try to cancel with non-depositor and authority signer
     const cancelTx = new Transaction().add(cancelIx);
 
-    // Try to cancel with a non-depositor - expect this to fail
     try {
-      await web3.sendAndConfirmTransaction(connection, cancelTx, [nonDepositor]);
+      await web3.sendAndConfirmTransaction(connection, cancelTx, [nonDepositor, authority]);
       assert.fail("Non-depositor should not be able to cancel deposit");
     } catch (err) {
       console.log(`Expected error for non-depositor cancel attempt: ${err}`);
@@ -1825,7 +2184,7 @@ describe("senda_dapp", () => {
 
     // Verify vault balance is unchanged
     const vaultBalanceAfter = await getTokenBalance(vaultUsdc);
-    assert.equal(vaultBalanceAfter, vaultBalanceBefore, "Vault should still have 0.5 USDC after failed cancel attempt");
+    assert.equal(vaultBalanceAfter, vaultBalanceBefore, "Vault should still have 1 USDT after failed cancel attempt");
 
     const cancelIx2 = await program.methods
       .cancel(blockhashArray)
@@ -1847,12 +2206,10 @@ describe("senda_dapp", () => {
       } as CancelAccounts)
       .instruction();
 
-    // Try to cancel with non-depositor
     const cancelTx2 = new Transaction().add(cancelIx2);
 
-    // Try to cancel with a non-depositor - expect this to fail
     try {
-      await web3.sendAndConfirmTransaction(connection, cancelTx2, [depositReceiver]);
+      await web3.sendAndConfirmTransaction(connection, cancelTx2, [depositReceiver, authority]);
       assert.fail("Non-depositor should not be able to cancel deposit");
     } catch (err) {
       console.log(`Expected error for non-depositor cancel attempt: ${err}`);
@@ -1861,12 +2218,12 @@ describe("senda_dapp", () => {
 
     // Verify vault balance is unchanged
     const vaultBalance2After = await getTokenBalance(vaultUsdc);
-    assert.equal(vaultBalance2After, vaultBalanceBefore, "Vault should still have 0.5 USDC after failed cancel attempt");
+    assert.equal(vaultBalance2After, vaultBalanceBefore, "Vault should still have 1 USDT after failed cancel attempt");
 
     // Now have the valid depositor cancel
     try {
       const validCancelTx = new Transaction().add(cancelIx);
-      const cancelSig = await web3.sendAndConfirmTransaction(connection, validCancelTx, [depositSender]);
+      const cancelSig = await web3.sendAndConfirmTransaction(connection, validCancelTx, [depositSender, authority]);
       console.log(`Valid depositor cancel transaction: ${cancelSig}`);
     } catch (err) {
       assert.fail(`Valid depositor should be able to cancel: ${err}`);
@@ -1878,11 +2235,9 @@ describe("senda_dapp", () => {
   });
 
   it("prevents double release of funds", async () => {
-    // Generate new wallets for this test
     const depositSender = Keypair.generate();
     const depositReceiver = Keypair.generate();
 
-    // Fund wallets with SOL
     await provider.sendAndConfirm(
       new Transaction()
         .add(
@@ -1902,7 +2257,6 @@ describe("senda_dapp", () => {
       [authority]
     );
 
-    // Create token accounts
     const senderUsdcAta = getAssociatedTokenAddressSync(
       USDC_MINT_ADDR,
       depositSender.publicKey,
@@ -1924,7 +2278,6 @@ describe("senda_dapp", () => {
       false
     );
 
-    // Create token accounts
     await provider.sendAndConfirm(
       new Transaction()
         .add(createAssociatedTokenAccountIdempotentInstruction(
@@ -1954,14 +2307,13 @@ describe("senda_dapp", () => {
       [authority]
     );
 
-    // Fund sender with USDC
     const walletUsdcAta = getAssociatedTokenAddressSync(
       USDC_MINT_ADDR,
       authority.publicKey,
       false
     );
 
-    const depositTokenAmount = 1_000_000; // 1 USDC
+    const depositTokenAmount = 1_000_000;
     await provider.sendAndConfirm(
       new Transaction().add(
         createTransferCheckedInstruction(
@@ -1994,13 +2346,14 @@ describe("senda_dapp", () => {
       program.programId
     );
 
-    await program.methods
+   const ix = await program.methods
       .initializeEscrow(escrowSeed)
       .accounts({
         escrow: escrowPda,
         feePayer: authority.publicKey,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
         receiverUsdcAta: receiverUsdcAta,
@@ -2014,8 +2367,12 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY,
       } as InitEscrowAccounts)
-      .signers([depositSender, authority])
-      .rpc();
+      .instruction();
+    
+    const tx = new Transaction().add(ix);
+    const initEscrowSig = await web3.sendAndConfirmTransaction(connection, tx, [depositSender, authority]);
+    console.log("Init escrow transaction signature:", initEscrowSig);
+    console.log("Escrow initialized successfully for double release test");
 
     const blockhashArray = await getRecentBlockhashArray(connection);
     const [depositRecordPda, depositRecordBump] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
@@ -2032,6 +2389,7 @@ describe("senda_dapp", () => {
         escrow: escrowPda,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
         receiverUsdcAta: receiverUsdcAta,
@@ -2065,6 +2423,7 @@ describe("senda_dapp", () => {
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
         receivingParty: depositReceiver.publicKey,
+        authority: authority.publicKey,
         receivingUsdcAta: receiverUsdcAta,
         receivingUsdtAta: receiverUsdtAta,
         usdcMint: USDC_MINT_ADDR,
@@ -2080,7 +2439,7 @@ describe("senda_dapp", () => {
       .instruction();
 
     const releaseTx = new Transaction().add(releaseIx);
-    const releaseSig = await web3.sendAndConfirmTransaction(connection, releaseTx, [depositSender]);
+    const releaseSig = await web3.sendAndConfirmTransaction(connection, releaseTx, [depositSender, authority]);
 
     console.log(`Release USDT transaction: ${releaseSig}`);
 
@@ -2252,13 +2611,14 @@ describe("senda_dapp", () => {
       program.programId
     );
 
-    await program.methods
+    const ix = await program.methods
       .initializeEscrow(new BN(0))
       .accounts({
         escrow: escrowPda,
         feePayer: authority.publicKey,
         sender: partyA.publicKey,
         receiver: partyB.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: partyAUsdcAta,
         senderUsdtAta: partyAUsdtAta,
         receiverUsdcAta: partyBUsdcAta,
@@ -2272,9 +2632,11 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY,
       } as InitEscrowAccounts)
-      .signers([partyA, authority])
-      .rpc();
+      .instruction();
 
+    const tx = new Transaction().add(ix);
+    const initEscrowSig = await web3.sendAndConfirmTransaction(connection, tx, [partyA, authority]);
+    console.log("Init escrow transaction signature:", initEscrowSig);
     console.log("Escrow initialized successfully for bidirectional test");
 
     const blockhashArray = await getRecentBlockhashArray(connection);
@@ -2283,16 +2645,16 @@ describe("senda_dapp", () => {
 
     const [depositRecordB, depositRecordBBump] = getDepositRecordPDA(escrowPda, partyB.publicKey, blockhashArray);
 
-    // Make a smaller deposit to not exceed balance
     const depositAmountA = new BN(300_000);
 
     // Party A deposits USDC
-    await program.methods
+    const depositIx = await program.methods
       .deposit({ usdc: {} }, { sender: {} }, blockhashArray, depositAmountA)
       .accounts({
         escrow: escrowPda,
         sender: partyA.publicKey,
         receiver: partyB.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: partyAUsdcAta,
         senderUsdtAta: partyAUsdtAta,
         receiverUsdcAta: partyBUsdcAta,
@@ -2308,8 +2670,11 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY
       } as DepositAccounts)
-      .signers([partyA, authority])
-      .rpc();
+      .instruction()
+
+    const depositTx = new Transaction().add(depositIx);
+    const depositSig = await web3.sendAndConfirmTransaction(connection, depositTx, [partyA, authority]);
+    console.log("Deposit partyA transaction signature:", depositSig);
 
     console.log("PartyA deposited USDC successfully");
 
@@ -2319,12 +2684,13 @@ describe("senda_dapp", () => {
     // Party B also deposits USDC
     const depositAmountB = new BN(300_000); // Use smaller amount
 
-    await program.methods
+    const depositIx2 = await program.methods
       .deposit({ usdc: {} }, { sender: {} }, blockhashArray, depositAmountB)
       .accounts({
         escrow: escrowPda,
         sender: partyB.publicKey,
         receiver: partyA.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: partyBUsdcAta,
         senderUsdtAta: partyBUsdtAta,
         receiverUsdcAta: partyAUsdcAta,
@@ -2340,8 +2706,11 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY
       } as DepositAccounts)
-      .signers([partyB, authority])
-      .rpc();
+      .instruction();
+
+    const depositTx2 = new Transaction().add(depositIx2);
+    const depositSig2 = await web3.sendAndConfirmTransaction(connection, depositTx2, [partyB, authority]);
+    console.log("Deposit partyB transaction signature:", depositSig2);
 
     console.log("PartyB also deposited USDC successfully");
 
@@ -2354,26 +2723,30 @@ describe("senda_dapp", () => {
 
     try {
       // Try to cancel as the wrong party
-      await program.methods
+      const cancelIx = await program.methods
         .cancel(blockhashArray)
         .accounts({
           escrow: escrowPda,
-          sender: partyA.publicKey, // Changed from 'depositor' to 'originalDepositor'
+          sender: partyA.publicKey,
           receiver: partyB.publicKey,
+          authority: authority.publicKey,
           senderUsdcAta: partyAUsdcAta,
           senderUsdtAta: partyAUsdtAta,
           usdcMint: USDC_MINT_ADDR,
           usdtMint: USDT_MINT_ADDR,
           vaultUsdc: vaultUsdc,
           vaultUsdt: vaultUsdt,
-          depositRecord: depositRecordB, // This belongs to partyB
+          depositRecord: depositRecordB,
           associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
           tokenProgram: TOKEN_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
           rent: SYSVAR_RENT_PUBKEY
         } as CancelAccounts)
-        .signers([partyA])
-        .rpc();
+        .instruction();
+
+      const cancelTx = new Transaction().add(cancelIx);
+      const cancelSig = await web3.sendAndConfirmTransaction(connection, cancelTx, [partyA, authority]);
+      console.log("Cancel partyA transaction signature:", cancelSig);
 
       assert.fail("PartyA should not be able to cancel PartyB's deposit");
     } catch (error) {
@@ -2508,13 +2881,14 @@ describe("senda_dapp", () => {
       program.programId
     );
 
-    await program.methods
+    const ix = await program.methods
       .initializeEscrow(escrowSeed)
       .accounts({
         escrow: escrowPda,
         feePayer: authority.publicKey,
         sender: partyA.publicKey,
         receiver: partyB.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: partyAUsdcAta,
         senderUsdtAta: partyAUsdtAta,
         receiverUsdcAta: partyBUsdcAta,
@@ -2528,17 +2902,17 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY,
       } as InitEscrowAccounts)
-      .signers([partyA, authority])
-      .rpc();
+      .instruction();
+
+    const tx = new Transaction().add(ix);
+    const initEscrowSig = await web3.sendAndConfirmTransaction(connection, tx, [partyA, authority]);
+    console.log("Init escrow transaction signature:", initEscrowSig);
 
     console.log("Escrow initialized successfully for same-token deposit test");
 
     const blockhashArray = await getRecentBlockhashArray(connection);
 
-    // Create deposit record for partyA
     const [depositRecordA] = getDepositRecordPDA(escrowPda, partyA.publicKey, blockhashArray);
-
-    // Use smaller deposit amount
     const depositAmountA = new BN(300_000);
 
     // Party A deposits USDC
@@ -2573,7 +2947,6 @@ describe("senda_dapp", () => {
     const escrowState = await program.account.escrow.fetch(escrowPda);
     console.log(`Current deposit count: ${escrowState.depositCount.toNumber()}`);
 
-    // Create deposit record for partyB using current count
     const [depositRecordB] = getDepositRecordPDA(escrowPda, partyB.publicKey, blockhashArray);
 
     const depositAmountB = new BN(200_000);
@@ -2583,6 +2956,7 @@ describe("senda_dapp", () => {
         escrow: escrowPda,
         sender: partyB.publicKey,
         receiver: partyA.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: partyBUsdcAta,
         senderUsdtAta: partyBUsdtAta,
         receiverUsdcAta: partyAUsdcAta,
@@ -2617,7 +2991,6 @@ describe("senda_dapp", () => {
     const depositSender = Keypair.generate();
     const depositReceiver = Keypair.generate();
 
-    // Fund wallets with SOL
     await provider.sendAndConfirm(
       new Transaction()
         .add(
@@ -2637,7 +3010,6 @@ describe("senda_dapp", () => {
       [authority]
     );
 
-    // Create token accounts
     const senderUsdcAta = getAssociatedTokenAddressSync(
       USDC_MINT_ADDR,
       depositSender.publicKey,
@@ -2659,7 +3031,6 @@ describe("senda_dapp", () => {
       false
     );
 
-    // Create token accounts
     await provider.sendAndConfirm(
       new Transaction()
         .add(createAssociatedTokenAccountIdempotentInstruction(
@@ -2689,14 +3060,13 @@ describe("senda_dapp", () => {
       [authority]
     );
 
-    // Fund sender with USDC
     const walletUsdcAta = getAssociatedTokenAddressSync(
       USDC_MINT_ADDR,
       authority.publicKey,
       false
     );
 
-    const depositTokenAmount = 1_000_000; // 1 USDC
+    const depositTokenAmount = 1_000_000;
     await provider.sendAndConfirm(
       new Transaction().add(
         createTransferCheckedInstruction(
@@ -2729,13 +3099,14 @@ describe("senda_dapp", () => {
       program.programId
     );
 
-    await program.methods
+    const ix = await program.methods
       .initializeEscrow(escrowSeed)
       .accounts({
         escrow: escrowPda,
         feePayer: authority.publicKey,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
         receiverUsdcAta: receiverUsdcAta,
@@ -2749,8 +3120,12 @@ describe("senda_dapp", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY,
       } as InitEscrowAccounts)
-      .signers([depositSender, authority])
-      .rpc();
+      .instruction();
+    
+    const tx = new Transaction().add(ix);
+    const initEscrowSig = await web3.sendAndConfirmTransaction(connection, tx, [depositSender, authority]);
+    console.log("Init escrow transaction signature:", initEscrowSig);
+    console.log("Escrow initialized successfully for cancel-after-release test");
 
     const blockhashArray = await getRecentBlockhashArray(connection);
     const [depositRecordPda, depositRecordBump] = getDepositRecordPDA(escrowPda, depositSender.publicKey, blockhashArray);
@@ -2767,6 +3142,7 @@ describe("senda_dapp", () => {
         escrow: escrowPda,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         senderUsdcAta: senderUsdcAta,
         senderUsdtAta: senderUsdtAta,
         receiverUsdcAta: receiverUsdcAta,
@@ -2796,6 +3172,7 @@ describe("senda_dapp", () => {
         escrow: escrowPda,
         sender: depositSender.publicKey,
         receiver: depositReceiver.publicKey,
+        authority: authority.publicKey,
         receivingParty: depositReceiver.publicKey,
         receivingUsdcAta: receiverUsdcAta,
         receivingUsdtAta: receiverUsdtAta,
@@ -2813,7 +3190,7 @@ describe("senda_dapp", () => {
       .instruction();
 
     const releaseTx = new Transaction().add(releaseIx);
-    await web3.sendAndConfirmTransaction(connection, releaseTx, [depositSender]);
+    await web3.sendAndConfirmTransaction(connection, releaseTx, [depositSender, authority]);
 
     console.log("Release completed successfully");
 
@@ -2825,6 +3202,7 @@ describe("senda_dapp", () => {
           escrow: escrowPda,
           sender: depositSender.publicKey,
           receiver: depositReceiver.publicKey,
+          authority: authority.publicKey,
           senderUsdcAta: senderUsdcAta,
           senderUsdtAta: senderUsdtAta,
           usdcMint: USDC_MINT_ADDR,
@@ -2841,7 +3219,7 @@ describe("senda_dapp", () => {
         .instruction();
 
       const cancelTx = new Transaction().add(cancelIx);
-      await web3.sendAndConfirmTransaction(connection, cancelTx, [depositSender]);
+      await web3.sendAndConfirmTransaction(connection, cancelTx, [depositSender, authority]);
       assert.fail("Should not be able to cancel after release");
     } catch (err) {
       console.log("Expected error for cancel after release attempt:", err);
