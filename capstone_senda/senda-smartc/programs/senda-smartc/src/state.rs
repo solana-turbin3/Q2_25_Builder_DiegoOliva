@@ -40,6 +40,7 @@ pub struct Escrow {
 
     pub sender: Pubkey,
     pub receiver: Pubkey,
+    pub authority: Pubkey,
 
     pub usdc_mint: Pubkey,
     pub usdt_mint: Pubkey,
