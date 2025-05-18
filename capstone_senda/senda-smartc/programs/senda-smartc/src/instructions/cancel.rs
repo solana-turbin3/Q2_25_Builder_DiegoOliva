@@ -24,6 +24,13 @@ pub struct Cancel<'info> {
 
     #[account(
         mut,
+        signer,
+        constraint = authority.key() == escrow.authority @ ErrorCode::InvalidAuthority
+    )]
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
         associated_token::mint = usdc_mint,
         associated_token::authority = sender,
     )]
