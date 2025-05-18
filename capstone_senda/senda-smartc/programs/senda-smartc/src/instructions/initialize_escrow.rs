@@ -7,13 +7,20 @@ use anchor_spl::{
 };
 
 use crate::error::ErrorCode;
-use crate::state::{Escrow, EscrowState, USDC_MINT_ADDR, USDT_MINT_ADDR};
+use crate::state::{Escrow, EscrowState, Factory, USDC_MINT_ADDR, USDT_MINT_ADDR};
 
 #[derive(Accounts)]
 pub struct InitializeEscrow<'info> {
     /// CHECK: fee payer
     #[account(mut, signer)]
     pub fee_payer: AccountInfo<'info>,
+
+    #[account(
+        seeds = [b"factory", authority.key().as_ref()],
+        bump,
+        constraint = factory.admin == authority.key() @ ErrorCode::InvalidAuthority
+    )]
+    pub factory: Account<'info, Factory>,
 
     #[account(
         init,
@@ -28,6 +35,13 @@ pub struct InitializeEscrow<'info> {
     pub sender: Signer<'info>,
     /// CHECK: we're just storing the pubkey
     pub receiver: AccountInfo<'info>,
+
+    #[account(
+        mut, 
+        signer,
+        constraint = authority.key() != sender.key() @ ErrorCode::InvalidAuthority
+    )]
+    pub authority: Signer<'info>,
 
     #[account(
         associated_token::mint = usdc_mint,
@@ -108,6 +122,7 @@ impl<'info> InitializeEscrow<'info> {
             seed,
             sender: self.sender.key(),
             receiver: self.receiver.key(),
+            authority: self.authority.key(),
             usdc_mint: self.usdc_mint.key(),
             usdt_mint: self.usdt_mint.key(),
             vault_usdc: self.vault_usdc.key(),
@@ -124,5 +139,4 @@ impl<'info> InitializeEscrow<'info> {
         Ok(())
     }
 }
-
 // @todo allow users to link multiple wallets to the protocol, while keeping a single escrow per sender/receiver pair - users must set a primary wallet
