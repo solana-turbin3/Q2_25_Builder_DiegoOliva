@@ -24,6 +24,13 @@ pub struct Deposit<'info> {
 
     #[account(
         mut,
+        signer,
+        constraint = authority.key() == escrow.authority @ ErrorCode::InvalidAuthority
+    )]
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
         associated_token::mint = usdc_mint,
         associated_token::authority = sender,
     )]
@@ -125,7 +132,7 @@ impl<'info> Deposit<'info> {
         let escrow = &mut self.escrow;
         let deposit_idx = escrow.deposit_count;
 
-        // Create the signature policy based on authorization
+        // signature policy based on authorization
         let policy = authorization.to_policy(escrow.sender, escrow.receiver);
 
         self.deposit_record.set_inner(DepositRecord {
